@@ -39,6 +39,14 @@ use x25519_dalek::{EphemeralSecret, PublicKey as XPublicKey};
 #[derive(Debug)]
 pub enum HapError {
     Io(std::io::Error),
+    /// A TCP connect-phase failure (refused, timed out, unreachable)
+    /// from SecureConn::open only. Renders identically to Io, but lets
+    /// fetch/set callers tell "could not even connect" apart from a
+    /// mid-session I/O failure: only the former may trigger the
+    /// rediscovery fallback (see rediscover_address). Pair-setup
+    /// connects never produce this variant (they use Conn::connect
+    /// directly), so pairing error handling is untouched.
+    ConnectIo(std::io::Error),
     Msg(String),
 }
 
@@ -46,8 +54,19 @@ impl fmt::Display for HapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HapError::Io(e) => write!(f, "network error: {}", e),
+            HapError::ConnectIo(e) => write!(f, "network error: {}", e),
             HapError::Msg(m) => write!(f, "{}", m),
         }
+    }
+}
+
+impl HapError {
+    /// True only for a connect-phase TCP failure: the accessory was
+    /// not reached at all. Mid-session I/O failures, HAP protocol
+    /// errors, and pairing/auth errors are never connect-phase, so
+    /// they must never trigger rediscovery.
+    pub fn is_connect_phase(&self) -> bool {
+        matches!(self, HapError::ConnectIo(_))
     }
 }
 
@@ -665,7 +684,11 @@ pub struct ThermostatPairing {
     /// The accessory's Ed25519 public key, hex (32 bytes).
     #[serde(default)]
     pub accessory_ltpk_hex: String,
-    /// Last-known accessory address (discovery refreshes this on use).
+    /// Last-known accessory address. Written once at pairing; updated
+    /// only by the connect-phase rediscovery fallback (see
+    /// rediscover_address): when a fetch/set cannot even connect, the
+    /// app re-discovers by exact accessory name and adopts the new
+    /// address if it changed. Nothing else updates this field.
     #[serde(default)]
     pub accessory_ip: String,
     #[serde(default)]
@@ -1149,6 +1172,7 @@ fn begin_pair_setup_inner(device: &DiscoveredDevice) -> HapResult<PendingPairSet
 fn is_session_expired(e: &HapError) -> bool {
     match e {
         HapError::Io(io) => io.kind() == std::io::ErrorKind::TimedOut,
+        HapError::ConnectIo(io) => io.kind() == std::io::ErrorKind::TimedOut,
         HapError::Msg(m) => m.contains("accessory closed the connection"),
     }
 }
@@ -1321,7 +1345,14 @@ pub struct SecureConn {
 impl SecureConn {
     pub fn open(pairing: &ThermostatPairing) -> HapResult<Self> {
         pairing.validate()?;
-        let mut conn = Conn::connect(&pairing.accessory_ip, pairing.accessory_port)?;
+        // The TCP connect is the only connect-phase step: mark its
+        // failures distinctly so callers can rediscover on them
+        // without ever mistaking a mid-session failure for one.
+        let mut conn = Conn::connect(&pairing.accessory_ip, pairing.accessory_port)
+            .map_err(|e| match e {
+                HapError::Io(io) => HapError::ConnectIo(io),
+                other => other,
+            })?;
 
         // M1: ephemeral X25519 public key.
         let secret = EphemeralSecret::random_from_rng(rand::thread_rng());
@@ -2369,6 +2400,48 @@ fn discover_inner(timeout: Duration) -> HapResult<Vec<DiscoveredDevice>> {
     Ok(out)
 }
 
+/// The discovered device advertising exactly `name`. Exact match
+/// only: a near miss, a substring, or "the first device found" must
+/// never qualify — adopting another accessory's address would point
+/// the paired keys at the wrong unit.
+pub fn rediscovery_match<'a>(devices: &'a [DiscoveredDevice], name: &str) -> Option<&'a DiscoveredDevice> {
+    devices.iter().find(|d| d.name == name)
+}
+
+/// First IPv4 address of the exact-name match, but only when it
+/// differs from the stored address. None covers every no-update case:
+/// no exact-name match, no IPv4 address advertised, or the address
+/// is unchanged — the caller keeps the stored address and surfaces
+/// the original error in all of them.
+pub fn rediscovery_new_ip(
+    pairing: &ThermostatPairing,
+    devices: &[DiscoveredDevice],
+) -> Option<String> {
+    let dev = rediscovery_match(devices, &pairing.accessory_name)?;
+    let ip = dev
+        .addresses
+        .iter()
+        .find(|a| a.parse::<std::net::Ipv4Addr>().is_ok())?;
+    if *ip == pairing.accessory_ip {
+        None
+    } else {
+        Some(ip.clone())
+    }
+}
+
+/// Connect-phase rediscovery fallback, used by fetch/set workers
+/// after a connect-phase failure only. Runs one 8 s discovery (the
+/// pairing duration), finds the paired accessory by exact name, and
+/// returns its new IPv4 address when it changed. The caller persists
+/// the address (new TstatResult variant, UI thread) and retries its
+/// operation once against it. Returns None — caller keeps the stored
+/// address and the original error — when discovery fails, nothing
+/// matches by exact name, or the address is unchanged.
+pub fn rediscover_address(pairing: &ThermostatPairing) -> Option<String> {
+    let devs = discover(Duration::from_secs(8)).ok()?;
+    rediscovery_new_ip(pairing, &devs)
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests (no hardware needed). The SRP consistency test implements a
 // minimal server side from the same formulas and asserts client and
@@ -2394,6 +2467,84 @@ mod tests {
         let enc = tlv_encode(&refs);
         let dec = tlv_decode(&enc).unwrap();
         assert_eq!(dec, items);
+    }
+
+    fn rediscovery_device(name: &str, addresses: &[&str]) -> DiscoveredDevice {
+        DiscoveredDevice {
+            name: name.to_string(),
+            addresses: addresses.iter().map(|a| a.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rediscovery_match_requires_exact_name() {
+        let devs = vec![
+            rediscovery_device("Tstat-79E7F2", &["192.168.68.99"]),
+            rediscovery_device("Tstat-OTHER", &["192.168.68.100"]),
+        ];
+        assert_eq!(
+            rediscovery_match(&devs, "Tstat-79E7F2").unwrap().name,
+            "Tstat-79E7F2"
+        );
+        // Near misses never qualify: no substring, no prefix match,
+        // never "first device found".
+        assert!(rediscovery_match(&devs, "Tstat-79E7F").is_none());
+        assert!(rediscovery_match(&devs, "Tstat-79E7F2X").is_none());
+        assert!(rediscovery_match(&devs, "tstat-79e7f2").is_none());
+        assert!(rediscovery_match(&[], "Tstat-79E7F2").is_none());
+    }
+
+    #[test]
+    fn rediscovery_new_ip_only_when_changed() {
+        let mut pairing = ThermostatPairing::default();
+        pairing.accessory_name = "Tstat-79E7F2".to_string();
+        pairing.accessory_ip = "192.168.68.72".to_string();
+        // Moved: new address adopted.
+        let devs = vec![rediscovery_device("Tstat-79E7F2", &["192.168.68.99"])];
+        assert_eq!(
+            rediscovery_new_ip(&pairing, &devs).as_deref(),
+            Some("192.168.68.99")
+        );
+        // Unchanged: no update, caller keeps the stored address.
+        let devs = vec![rediscovery_device("Tstat-79E7F2", &["192.168.68.72"])];
+        assert!(rediscovery_new_ip(&pairing, &devs).is_none());
+        // IPv6-only advertisement: no IPv4 to adopt.
+        let devs = vec![rediscovery_device("Tstat-79E7F2", &["fe80::1"])];
+        assert!(rediscovery_new_ip(&pairing, &devs).is_none());
+        // IPv6 listed first: the first IPv4 still wins.
+        let devs = vec![rediscovery_device(
+            "Tstat-79E7F2",
+            &["fe80::1", "192.168.68.99"],
+        )];
+        assert_eq!(
+            rediscovery_new_ip(&pairing, &devs).as_deref(),
+            Some("192.168.68.99")
+        );
+        // Wrong device only: no match, no update.
+        let devs = vec![rediscovery_device("Tstat-OTHER", &["192.168.68.99"])];
+        assert!(rediscovery_new_ip(&pairing, &devs).is_none());
+    }
+
+    #[test]
+    fn connect_phase_error_classification() {
+        let refused = HapError::ConnectIo(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ));
+        assert!(refused.is_connect_phase());
+        // A mid-session I/O failure is not connect-phase: the unit
+        // answered, so its address is not stale.
+        let mid = HapError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ));
+        assert!(!mid.is_connect_phase());
+        // HAP/auth failures never trigger rediscovery either.
+        let auth = HapError::Msg("pair-verify M2 missing accessory public key".to_string());
+        assert!(!auth.is_connect_phase());
+        let rejected = HapError::Msg("thermostat rejected write(s)".to_string());
+        assert!(!rejected.is_connect_phase());
     }
 
     #[test]

@@ -4046,6 +4046,13 @@ enum TstatResult {
     Fetched(crate::hap::ThermostatState),
     /// A fetch failure. Clears fetch-busy only.
     FetchFailed(String),
+    /// The paired thermostat was rediscovered at a new address after
+    /// a connect-phase failure (fetch/set worker). The worker has
+    /// already retried its operation against the new address, so
+    /// this carries no operation result: the UI thread only adopts
+    /// the address into cfg.thermostat and saves config. Never
+    /// touches busy flags, tile state, or bridge replies.
+    ThermostatRediscovered(String),
     /// An optimistic set: the PUT succeeded but the readback failed,
     /// so the state is the intended one (see hap::SetOutcome). Handled
     /// like State, plus a prompt re-fetch to confirm.
@@ -7239,10 +7246,32 @@ impl App {
         self.tstat_last_fetch = Some(Instant::now());
         let tx = self.tstat_tx.clone();
         thread::spawn(move || {
-            let res = crate::hap::fetch_state(&pairing);
+            // Connect-phase failure only: the stored address may be
+            // stale (DHCP move). Rediscover by exact accessory name,
+            // adopt a changed address for the config (UI thread, via
+            // the variant below), and retry once against it. Any
+            // other error class keeps the stored address and the
+            // original error — never a guess, never another device.
+            let res = match crate::hap::fetch_state(&pairing) {
+                Err(e) if e.is_connect_phase() => {
+                    match crate::hap::rediscover_address(&pairing) {
+                        Some(new_ip) => {
+                            let _ = tx.send(TstatResult::ThermostatRediscovered(new_ip.clone()));
+                            let mut moved = pairing.clone();
+                            moved.accessory_ip = new_ip;
+                            crate::hap::fetch_state(&moved)
+                        }
+                        None => Err(e),
+                    }
+                }
+                other => other,
+            };
             let _ = tx.send(match res {
                 Ok(st) => TstatResult::Fetched(st),
-                Err(e) => TstatResult::FetchFailed(format!("Thermostat refresh failed: {}", e)),
+                Err(e) => TstatResult::FetchFailed(format!(
+                    "Thermostat refresh failed: {}",
+                    Self::humanize_tstat_error(&e.to_string())
+                )),
             });
         });
         true
@@ -7353,7 +7382,26 @@ impl App {
         self.tstat_set_busy = true;
         let tx = self.tstat_tx.clone();
         thread::spawn(move || {
-            let res = crate::hap::set_state(&pairing, &changes);
+            // Same connect-phase rediscovery as the fetch worker:
+            // on a failure to even connect, rediscover by exact name,
+            // adopt a changed address, and retry the set once
+            // against it. Set writes are absolute values (mode,
+            // temperatures, fan), so the one retry cannot
+            // double-apply. Any other error class retries nothing.
+            let res = match crate::hap::set_state(&pairing, &changes) {
+                Err(e) if e.is_connect_phase() => {
+                    match crate::hap::rediscover_address(&pairing) {
+                        Some(new_ip) => {
+                            let _ = tx.send(TstatResult::ThermostatRediscovered(new_ip.clone()));
+                            let mut moved = pairing.clone();
+                            moved.accessory_ip = new_ip;
+                            crate::hap::set_state(&moved, &changes)
+                        }
+                        None => Err(e),
+                    }
+                }
+                other => other,
+            };
             let _ = tx.send(match res {
                 Ok(crate::hap::SetOutcome::Confirmed(st)) => TstatResult::State(st),
                 Ok(crate::hap::SetOutcome::Optimistic(st)) => TstatResult::StateConfirm(st),
@@ -7538,6 +7586,27 @@ impl App {
                             });
                         }
                         other => self.bridge_pending = other,
+                    }
+                }
+                TstatResult::ThermostatRediscovered(new_ip) => {
+                    // Connect-phase rediscovery (fetch/set worker):
+                    // the worker already retried its operation
+                    // against the new address, so this only persists
+                    // the address. Never touches busy flags, tile
+                    // state, or bridge replies; never fires for a
+                    // fetch/set that succeeded or failed any other
+                    // way. A no-op when unpaired or already current.
+                    let old = match self.cfg.thermostat.as_mut() {
+                        Some(p) if p.accessory_ip != new_ip => {
+                            Some(std::mem::replace(&mut p.accessory_ip, new_ip.clone()))
+                        }
+                        _ => None,
+                    };
+                    if let Some(old) = old {
+                        save_config(&self.cfg);
+                        crate::hap::tstat_log(&format!(
+                            "Thermostat address updated: {old} -> {new_ip} (rediscovered)"
+                        ));
                     }
                 }
                 TstatResult::Fetched(st) => {
@@ -12971,6 +13040,49 @@ mod tests {
             app.tstat_error.as_deref(),
             Some("Thermostat control failed: boom")
         );
+    }
+
+    #[test]
+    fn thermostat_rediscovered_adopts_new_address_only() {
+        // Connect-phase rediscovery: the UI thread persists the new
+        // address and nothing else — no busy-flag, tile-state, or
+        // bridge side effects. (The save writes the test app's
+        // default config; no real user config exists in test envs.)
+        let mut app = gate_app();
+        let mut pairing = crate::hap::ThermostatPairing::default();
+        pairing.accessory_name = "Tstat-79E7F2".to_string();
+        pairing.accessory_ip = "192.168.68.72".to_string();
+        app.cfg.thermostat = Some(pairing);
+        app.tstat_tx
+            .send(TstatResult::ThermostatRediscovered(
+                "192.168.68.99".to_string(),
+            ))
+            .unwrap();
+        app.poll_net();
+        assert_eq!(
+            app.cfg.thermostat.as_ref().unwrap().accessory_ip,
+            "192.168.68.99"
+        );
+        // Already-current: a repeat is a silent no-op.
+        app.tstat_tx
+            .send(TstatResult::ThermostatRediscovered(
+                "192.168.68.99".to_string(),
+            ))
+            .unwrap();
+        app.poll_net();
+        assert_eq!(
+            app.cfg.thermostat.as_ref().unwrap().accessory_ip,
+            "192.168.68.99"
+        );
+        // Unpaired: nothing to update, no crash.
+        app.cfg.thermostat = None;
+        app.tstat_tx
+            .send(TstatResult::ThermostatRediscovered(
+                "192.168.68.99".to_string(),
+            ))
+            .unwrap();
+        app.poll_net();
+        assert!(app.cfg.thermostat.is_none());
     }
 
     #[test]
