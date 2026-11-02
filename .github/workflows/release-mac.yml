@@ -36,6 +36,10 @@ on:
         description: "Existing release tag to build (e.g. v1.4.0)"
         required: true
         type: string
+      ref:
+        description: "Optional code ref to build instead of the tag (e.g. a main commit for a patched build of an existing version)"
+        required: false
+        type: string
 
 permissions:
   contents: write # gh release upload
@@ -62,7 +66,10 @@ jobs:
       - name: Check out the release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.rel.outputs.tag }}
+          # Patched builds: an explicit ref overrides the tag, so a
+          # patched build of an existing version can be built from
+          # main (or a commit) while still uploading to that version.
+          ref: ${{ inputs.ref || steps.rel.outputs.tag }}
 
       - name: Install the Apple Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
