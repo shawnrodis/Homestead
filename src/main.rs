@@ -345,6 +345,20 @@ struct Prefs {
     /// exists. "" = never recorded yet.
     #[serde(default)]
     last_monitor_device: String,
+    /// Friendly name of that monitor (v2.0.6 patch), recorded
+    /// alongside the device: DISPLAY numbers can swap across
+    /// boots when sleeping DisplayPort monitors wake in a
+    /// different order, so the name + orientation act as a
+    /// second identity the restore can fall back on (see
+    /// resolve_startup_monitor). "" = recorded before this
+    /// field existed; the device alone decides then.
+    #[serde(default)]
+    last_monitor_name: String,
+    /// "Portrait" | "Landscape" for that monitor (v2.0.6 patch),
+    /// from its rect at record time — the other half of the
+    /// fallback identity. "" = not recorded yet.
+    #[serde(default)]
+    last_monitor_orientation: String,
     /// Keep running in the system tray when the window is closed
     /// (v1.2.1) instead of quitting.
     #[serde(default)]
@@ -390,6 +404,8 @@ impl Default for Prefs {
             start_with_windows: false,
             launch_mode: default_launch_mode(),
             last_monitor_device: String::new(),
+            last_monitor_name: String::new(),
+            last_monitor_orientation: String::new(),
             close_to_tray: false,
             tray_notice_shown: false,
         }
@@ -1449,13 +1465,30 @@ const SNAP_MAX_MOVES: u8 = 2;
 const SNAP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Launch-window self-check budget (v2.0.1): the window after
-/// the first frame during which a Maximized launch is
-/// re-verified against its remembered monitor. Covers an initial
+/// the intended monitor is first resolved during which a
+/// Maximized launch is re-verified against it. Covers an initial
 /// snap (≤ SNAP_TIMEOUT) plus a settle pause plus one re-armed
 /// snap (≤ SNAP_TIMEOUT) with room to spare; past it the check
 /// stops permanently for the session and the window stays
-/// wherever it verifiably is.
+/// wherever it verifiably is. The clock starts when the target
+/// first resolves, not at the first frame — a display that wakes
+/// late (a sleeping DisplayPort monitor at login) must not eat
+/// the whole budget before it even appears (v2.0.6 patch).
 const STARTUP_CHECK_WINDOW: Duration = Duration::from_secs(10);
+/// Outer bound for the launch check (v2.0.6 patch): the check
+/// never expires while the remembered display has not been seen
+/// at all, but it does not wait forever either — past this the
+/// display counts as gone and the window stays where Windows
+/// put it, per the help text. Bounds the surprise of a very
+/// late snap to the launch minute.
+const STARTUP_CHECK_OUTER_WINDOW: Duration = Duration::from_secs(60);
+/// How often the check re-probes for a not-yet-seen target
+/// display (v2.0.6 patch): enumeration every frame while the
+/// target is missing would run for up to the outer window, so
+/// the probe is throttled to this cadence. The decision inputs
+/// are unaffected — on_target is false while unresolved, and a
+/// snap can only arm once the target is known.
+const STARTUP_CHECK_TARGET_PROBE: Duration = Duration::from_secs(1);
 /// Settle pause after a snap job ends before the self-check may
 /// act on a wrong-monitor reading: a just-maximized window can
 /// transiently straddle monitors while the OS animation lands,
@@ -1580,6 +1613,63 @@ fn startup_check_next(
     (Wait, seen_maximized)
 }
 
+/// The launch check's expiry rule (v2.0.6 patch), kept free of
+/// Win32 so it is unit-testable like startup_check_next: the
+/// check expires at the outer wall clock even if the target
+/// never appeared, or — once the target has been seen — at the
+/// verification deadline. It never expires on the verification
+/// clock alone while the target is unseen: a display that wakes
+/// late must not consume the budget before it exists.
+fn startup_check_expired(
+    now: Instant,
+    deadline: Option<Instant>,
+    outer_deadline: Instant,
+) -> bool {
+    now >= outer_deadline || deadline.map(|d| now >= d).unwrap_or(false)
+}
+
+/// Resolve the intended startup monitor (v2.0.6 patch), kept
+/// free of Win32 so it is unit-testable. The device string is
+/// the primary identity, but DISPLAY numbers can swap across
+/// boots when sleeping DisplayPort monitors wake in a different
+/// order — so when a saved name + orientation exist, they act
+/// as a second identity with these rules, in order:
+///  1. A device match whose name + orientation agree is the
+///     monitor (the normal case).
+///  2. Otherwise a UNIQUE name + orientation match elsewhere
+///     wins over the device (the swap case: the numbers moved,
+///     the panels did not).
+///  3. Otherwise the device match stands (a rotated or renamed
+///     panel, or an old config with no signature — the previous
+///     behaviour, never worse).
+///  4. Otherwise nothing (a missing display is a no-op).
+/// Ambiguity never overrides: when several monitors share the
+/// signature (identical panels, same orientation), the device
+/// decides, exactly as before.
+fn resolve_startup_monitor<'a>(
+    monitors: &'a [MonitorInfo],
+    device: &str,
+    name: &str,
+    orientation: &str,
+) -> Option<&'a MonitorInfo> {
+    let device_hit = monitors.iter().find(|m| m.device == device);
+    if !name.is_empty() && !orientation.is_empty() {
+        if let Some(m) = device_hit {
+            if m.name == name && monitor_orientation(m) == orientation {
+                return Some(m);
+            }
+        }
+        let sig_hits: Vec<&MonitorInfo> = monitors
+            .iter()
+            .filter(|m| m.name == name && monitor_orientation(m) == orientation)
+            .collect();
+        if sig_hits.len() == 1 {
+            return Some(sig_hits[0]);
+        }
+    }
+    device_hit
+}
+
 /// An in-flight snap (v1.3.1): created by a Monitor-menu click,
 /// advanced per frame by App::advance_snap, dropped on success,
 /// failure or timeout. Never persisted.
@@ -1595,19 +1685,36 @@ struct SnapJob {
 
 /// Launch-window self-check state (v2.0.1, Windows): the
 /// maximized launch is re-verified against its remembered
-/// monitor for a bounded window after the first frame. Grouped
-/// so the App struct carries one field for the whole check.
-/// Identity only throughout — the remembered device string and
-/// the intended monitor's handle — never geometry.
+/// monitor for a bounded window after the intended monitor is
+/// first resolved (v2.0.6 patch: never while it is unseen).
+/// Grouped so the App struct carries one field for the whole
+/// check. Identity only throughout — the remembered device
+/// string, its name + orientation fallback, and the intended
+/// monitor's handle — never geometry.
 #[derive(Clone)]
 struct StartupCheckState {
     /// The check is still running (cleared on resolve, user
     /// takeover, or window expiry — never re-armed).
     active: bool,
-    /// First frame + STARTUP_CHECK_WINDOW.
-    deadline: Instant,
+    /// Target-first-seen + STARTUP_CHECK_WINDOW (None = the
+    /// target display has not appeared yet; the check cannot
+    /// expire on the verification clock until it does).
+    deadline: Option<Instant>,
+    /// First frame + STARTUP_CHECK_OUTER_WINDOW: the check
+    /// expires at this wall clock even if the target never
+    /// appeared — a missing display is a no-op, not a wait.
+    outer_deadline: Instant,
     /// Remembered device identity the check verifies against.
     device: String,
+    /// Remembered friendly name + orientation (v2.0.6 patch):
+    /// the fallback identity for resolve_startup_monitor.
+    sig_name: String,
+    sig_orientation: String,
+    /// The target display has been resolved at least once.
+    target_seen: bool,
+    /// Last probe for a not-yet-seen target (throttled to
+    /// STARTUP_CHECK_TARGET_PROBE; None = never probed).
+    last_target_probe: Option<Instant>,
     /// HMONITOR of the intended monitor once resolved from the
     /// device identity (0 = not resolved yet).
     target: isize,
@@ -1639,8 +1746,13 @@ impl Default for StartupCheckState {
     fn default() -> Self {
         Self {
             active: false,
-            deadline: Instant::now(),
+            deadline: None,
+            outer_deadline: Instant::now(),
             device: String::new(),
+            sig_name: String::new(),
+            sig_orientation: String::new(),
+            target_seen: false,
+            last_target_probe: None,
             target: 0,
             rearm_used: false,
             seen_maximized: false,
@@ -6265,12 +6377,23 @@ impl App {
         // or the window may open on target and drift during
         // startup settling — and the per-frame check covers all
         // three holes the one-shot check left open.
+        // v2.0.6 patch: the verification clock starts when the
+        // target first resolves (deadline None until then), the
+        // outer clock bounds a never-appearing display, and the
+        // target lookup uses the swap-resistant resolver.
+        let now = Instant::now();
         self.startup_check = StartupCheckState {
             active: true,
-            deadline: Instant::now() + STARTUP_CHECK_WINDOW,
+            deadline: None,
+            outer_deadline: now + STARTUP_CHECK_OUTER_WINDOW,
             device: saved.clone(),
+            sig_name: self.cfg.prefs.last_monitor_name.clone(),
+            sig_orientation: self.cfg.prefs.last_monitor_orientation.clone(),
+            target_seen: false,
+            last_target_probe: None,
             ..StartupCheckState::default()
         };
+        crate::hap::tstat_log(&format!("startup monitor: armed for {saved}"));
         if self.snap_job.is_some() {
             return;
         }
@@ -6278,12 +6401,18 @@ impl App {
             return;
         };
         let monitors = enumerate_monitors();
-        let Some(target) = monitors.iter().find(|m| m.device == saved) else {
+        let Some(target) = resolve_startup_monitor(
+            &monitors,
+            &saved,
+            &self.cfg.prefs.last_monitor_name,
+            &self.cfg.prefs.last_monitor_orientation,
+        ) else {
             return;
         };
         if win32_window_monitor(hwnd) == target.handle {
             return;
         }
+        crate::hap::tstat_log(&format!("startup monitor: snap to {}", target.name));
         self.snap_job = Some(SnapJob {
             silent: true,
             target: target.clone(),
@@ -6322,10 +6451,36 @@ impl App {
         };
         // Resolve the intended monitor's handle once; a fresh
         // enumeration also covers a display that appears late.
+        // v2.0.6 patch: while the target is unseen, probing is
+        // throttled (the check may now wait up to the outer
+        // window for a sleeping display), and the moment it
+        // resolves, the verification clock starts — the check
+        // must not expire on a budget the display never got
+        // to use.
         if self.startup_check.target == 0 {
-            let monitors = enumerate_monitors();
-            if let Some(m) = monitors.iter().find(|m| m.device == self.startup_check.device) {
-                self.startup_check.target = m.handle;
+            let now = Instant::now();
+            let probe_due = self
+                .startup_check
+                .last_target_probe
+                .map(|t| now >= t + STARTUP_CHECK_TARGET_PROBE)
+                .unwrap_or(true);
+            if probe_due {
+                self.startup_check.last_target_probe = Some(now);
+                let monitors = enumerate_monitors();
+                if let Some(m) = resolve_startup_monitor(
+                    &monitors,
+                    &self.startup_check.device,
+                    &self.startup_check.sig_name,
+                    &self.startup_check.sig_orientation,
+                ) {
+                    self.startup_check.target = m.handle;
+                    self.startup_check.target_seen = true;
+                    self.startup_check.deadline = Some(now + STARTUP_CHECK_WINDOW);
+                    crate::hap::tstat_log(&format!(
+                        "startup monitor: target appeared ({})",
+                        m.name
+                    ));
+                }
             }
         }
         // The user-move signal: a top-left change with no snap
@@ -6338,7 +6493,11 @@ impl App {
         let cur = win32_window_monitor(hwnd);
         let facts = StartupCheckFacts {
             snap_active,
-            expired: Instant::now() >= self.startup_check.deadline,
+            expired: startup_check_expired(
+                Instant::now(),
+                self.startup_check.deadline,
+                self.startup_check.outer_deadline,
+            ),
             maximized: win32_is_maximized(hwnd),
             on_target: self.startup_check.target != 0 && cur == self.startup_check.target,
             settle_passed: self
@@ -6360,22 +6519,39 @@ impl App {
             StartupCheckAction::Resolve | StartupCheckAction::StopUserTakeover => {
                 self.startup_check.active = false;
                 self.startup_check.last_snap_failed = false;
+                if action == StartupCheckAction::Resolve {
+                    crate::hap::tstat_log("startup monitor: resolved on target");
+                }
             }
             StartupCheckAction::ExpireUnresolved => {
                 self.startup_check.active = false;
                 self.startup_check.unresolved = true;
                 self.startup_check.unresolved_monitor = cur;
                 self.startup_check.last_snap_failed = false;
+                crate::hap::tstat_log(&format!(
+                    "startup monitor: expired off target (target seen: {})",
+                    self.startup_check.target_seen
+                ));
             }
             StartupCheckAction::ArmSnap => {
+                // The target-resolution block above is the only
+                // prober while the target is unseen (throttled);
+                // arming must not enumerate every frame behind
+                // its back — wait for the probe to resolve it.
+                if self.startup_check.target == 0 {
+                    return;
+                }
                 // Fresh enumeration: the target must still
                 // exist, and its handle may have changed since
                 // the check resolved it.
                 let monitors = enumerate_monitors();
-                let Some(target) = monitors
-                    .iter()
-                    .find(|m| m.device == self.startup_check.device)
-                    .cloned()
+                let Some(target) = resolve_startup_monitor(
+                    &monitors,
+                    &self.startup_check.device,
+                    &self.startup_check.sig_name,
+                    &self.startup_check.sig_orientation,
+                )
+                .cloned()
                 else {
                     // Display gone; wait for the window to run
                     // out (a missing display is a no-op).
@@ -6436,8 +6612,19 @@ impl App {
         self.last_seen_monitor = cur;
         let monitors = enumerate_monitors();
         if let Some(m) = monitors.iter().find(|m| m.handle == cur) {
-            if self.cfg.prefs.last_monitor_device != m.device {
+            // v2.0.6 patch: the name + orientation travel with
+            // the device (see resolve_startup_monitor). The save
+            // fires when ANY part differs, so a config recorded
+            // before the signature fields existed gains one on
+            // the next monitor change instead of never.
+            let orientation = monitor_orientation(m);
+            if self.cfg.prefs.last_monitor_device != m.device
+                || self.cfg.prefs.last_monitor_name != m.name
+                || self.cfg.prefs.last_monitor_orientation != orientation
+            {
                 self.cfg.prefs.last_monitor_device = m.device.clone();
+                self.cfg.prefs.last_monitor_name = m.name.clone();
+                self.cfg.prefs.last_monitor_orientation = orientation.to_string();
                 save_config(&self.cfg);
             }
         }
@@ -14130,6 +14317,164 @@ mod tests {
         assert_eq!(startup_check_next(calm, true, true, false), (Wait, true));
         // A maximized observation is remembered for later frames.
         assert_eq!(startup_check_next(calm, false, false, false), (ArmSnap, true));
+    }
+
+    #[test]
+    fn startup_check_expiry_rule() {
+        // v2.0.6 patch: the verification clock never expires
+        // the check while the target is unseen; the outer clock
+        // always does.
+        let base = Instant::now();
+        let outer = base + Duration::from_secs(60);
+        let deadline = Some(base + Duration::from_secs(10));
+        // Unseen, inside the outer window: alive.
+        assert!(!startup_check_expired(
+            base + Duration::from_secs(30),
+            None,
+            outer
+        ));
+        // Unseen, past the outer window: expired.
+        assert!(startup_check_expired(
+            base + Duration::from_secs(61),
+            None,
+            outer
+        ));
+        // Seen, inside the verification window: alive.
+        assert!(!startup_check_expired(
+            base + Duration::from_secs(5),
+            deadline,
+            outer
+        ));
+        // Seen, past the verification window: expired.
+        assert!(startup_check_expired(
+            base + Duration::from_secs(11),
+            deadline,
+            outer
+        ));
+        // Boundary: exactly at either clock counts as expired.
+        assert!(startup_check_expired(base + Duration::from_secs(60), None, outer));
+        assert!(startup_check_expired(
+            base + Duration::from_secs(10),
+            deadline,
+            outer
+        ));
+        // An outer clock earlier than the verification deadline
+        // still wins.
+        assert!(startup_check_expired(
+            base + Duration::from_secs(61),
+            Some(base + Duration::from_secs(70)),
+            outer
+        ));
+    }
+
+    fn mon_named(
+        name: &str,
+        device: &str,
+        handle: isize,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) -> MonitorInfo {
+        MonitorInfo {
+            name: name.into(),
+            device: device.into(),
+            handle,
+            rect_px: [x, y, w, h],
+            scale: 1.0,
+            primary: false,
+        }
+    }
+
+    #[test]
+    fn startup_monitor_resolution() {
+        // Desk: landscape 2560x1440 at (0,0), portrait 2160x3840
+        // at (2560,0). Saved: portrait panel, DISPLAY2.
+        let landscape =
+            mon_named("LandscapePanel", "\\\\.\\DISPLAY1", 1, 0, 0, 2560, 1440);
+        let portrait =
+            mon_named("PortraitPanel", "\\\\.\\DISPLAY2", 2, 2560, 0, 2160, 3840);
+        let desk = vec![landscape.clone(), portrait.clone()];
+        // Normal case: device + signature agree.
+        assert_eq!(
+            resolve_startup_monitor(&desk, "\\\\.\\DISPLAY2", "PortraitPanel", "Portrait")
+                .map(|m| m.handle),
+            Some(2)
+        );
+        // DISPLAY numbers swapped across boots (sleeping DP
+        // monitors waking in a different order): the signature
+        // uniquely names the portrait panel, so it wins over
+        // the device, which now points at the landscape panel.
+        let swapped = vec![
+            mon_named("LandscapePanel", "\\\\.\\DISPLAY2", 1, 0, 0, 2560, 1440),
+            mon_named("PortraitPanel", "\\\\.\\DISPLAY1", 2, 2560, 0, 2160, 3840),
+        ];
+        assert_eq!(
+            resolve_startup_monitor(&swapped, "\\\\.\\DISPLAY2", "PortraitPanel", "Portrait")
+                .map(|m| m.handle),
+            Some(2)
+        );
+        // Ambiguous signature (two identical portrait panels
+        // sharing a name) never overrides the device.
+        let ambiguous = vec![
+            mon_named("LandscapePanel", "\\\\.\\DISPLAY2", 1, 0, 0, 2560, 1440),
+            mon_named("PortraitPanel", "\\\\.\\DISPLAY1", 2, 2560, 0, 2160, 3840),
+            mon_named("PortraitPanel", "\\\\.\\DISPLAY3", 3, 4720, 0, 2160, 3840),
+        ];
+        assert_eq!(
+            resolve_startup_monitor(&ambiguous, "\\\\.\\DISPLAY2", "PortraitPanel", "Portrait")
+                .map(|m| m.handle),
+            Some(1)
+        );
+        // Old config with no signature: the device decides.
+        assert_eq!(
+            resolve_startup_monitor(&desk, "\\\\.\\DISPLAY2", "", "").map(|m| m.handle),
+            Some(2)
+        );
+        // Device renumbered away entirely, signature unique:
+        // the signature still finds the panel.
+        let renumbered = vec![
+            mon_named("LandscapePanel", "\\\\.\\DISPLAY1", 1, 0, 0, 2560, 1440),
+            mon_named("PortraitPanel", "\\\\.\\DISPLAY3", 2, 2560, 0, 2160, 3840),
+        ];
+        assert_eq!(
+            resolve_startup_monitor(&renumbered, "\\\\.\\DISPLAY2", "PortraitPanel", "Portrait")
+                .map(|m| m.handle),
+            Some(2)
+        );
+        // Device gone, no signature: nothing (no-op).
+        assert_eq!(
+            resolve_startup_monitor(&renumbered, "\\\\.\\DISPLAY2", "", ""),
+            None
+        );
+        // Device gone, signature ambiguous: nothing, never a
+        // guess between identical panels.
+        let gone_ambiguous = vec![
+            mon_named("LandscapePanel", "\\\\.\\DISPLAY1", 1, 0, 0, 2560, 1440),
+            mon_named("PortraitPanel", "\\\\.\\DISPLAY3", 2, 2560, 0, 2160, 3840),
+            mon_named("PortraitPanel", "\\\\.\\DISPLAY4", 3, 4720, 0, 2160, 3840),
+        ];
+        assert_eq!(
+            resolve_startup_monitor(
+                &gone_ambiguous,
+                "\\\\.\\DISPLAY2",
+                "PortraitPanel",
+                "Portrait"
+            ),
+            None
+        );
+        // Panel rotated since recording (same device + name,
+        // orientation changed): the device stands — no
+        // signature match exists elsewhere to override it.
+        let rotated = vec![
+            mon_named("LandscapePanel", "\\\\.\\DISPLAY1", 1, 0, 0, 2560, 1440),
+            mon_named("PortraitPanel", "\\\\.\\DISPLAY2", 2, 2560, 0, 3840, 2160),
+        ];
+        assert_eq!(
+            resolve_startup_monitor(&rotated, "\\\\.\\DISPLAY2", "PortraitPanel", "Portrait")
+                .map(|m| m.handle),
+            Some(2)
+        );
     }
 
     #[test]
