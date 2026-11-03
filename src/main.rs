@@ -1934,6 +1934,46 @@ fn close_action(close_to_tray: bool, quitting: bool) -> CloseAction {
     }
 }
 
+/// The app icon handed to eframe (the viewport icon). eframe
+/// falls back to its own default icon (black hexagon-pinwheel)
+/// when no icon is given, and on macOS its AppTitleIconSetter
+/// writes that icon to NSApplication.applicationIconImage —
+/// overriding the bundle's AppIcon.icns in the Dock while
+/// running. Passing our own icon.png (the same artwork the
+/// bundle icon is generated from) keeps the Dock icon identical
+/// running or not. None only if the bundled PNG fails to decode
+/// (never in practice); eframe then uses its default as before.
+fn app_icon_data() -> Option<egui::IconData> {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok()
+}
+
+/// Which viewport command hides the window for close-to-tray.
+/// macOS Dock clicks restore MINIMIZED windows automatically
+/// but do nothing for ordered-out (invisible) windows, and
+/// winit 0.30 has no applicationShouldHandleReopen handler —
+/// so macOS minimizes (Dock-click restorable) while other
+/// platforms order out (unchanged behavior).
+fn hide_command_for_close_to_tray(macos: bool) -> egui::ViewportCommand {
+    if macos {
+        egui::ViewportCommand::Minimized(true)
+    } else {
+        egui::ViewportCommand::Visible(false)
+    }
+}
+
+/// Reconcile the hidden flag with a real focus event: a window
+/// that actually became key is visible, whatever the flag says.
+/// This is how a Dock-restored minimized window on macOS clears
+/// the flag — Dock restores send no app-level event. Unknown
+/// focus (None) never clears: only Some(true) does.
+fn sync_hidden_with_focus(window_hidden: bool, focused: Option<bool>) -> bool {
+    if focused == Some(true) {
+        false
+    } else {
+        window_hidden
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Single instance (v1.2.2, Windows) — v1.2.1 had NO instance guard:
 // closing to the tray hid the process, and every later Start Menu /
@@ -6825,17 +6865,29 @@ impl App {
         self.startup_monitor_self_check(ctx, frame);
         // Focus regained (clicking back into the window) is a
         // backoff reset trigger for camera feeds (v1.2.2).
-        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        let focused_opt = ctx.input(|i| i.viewport().focused);
+        let focused = focused_opt.unwrap_or(true);
         if focused && !self.prev_focused {
             self.kick_all_backoff();
         }
         self.prev_focused = focused;
+        // A real key-focus event means the window is visible:
+        // this clears the hidden flag after a Dock restore on
+        // macOS (which sends no app-level event). Unknown focus
+        // never clears, so launch-hidden state is untouched.
+        self.window_hidden = sync_hidden_with_focus(self.window_hidden, focused_opt);
         if ctx.input(|i| i.viewport().close_requested()) {
             if close_action(self.cfg.prefs.close_to_tray, self.quitting)
                 == CloseAction::HideToTray
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                // macOS: minimize, not order-out — a Dock click
+                // restores a minimized window automatically,
+                // while an ordered-out window stays hidden (and
+                // winit has no reopen handler to restore it).
+                ctx.send_viewport_cmd(hide_command_for_close_to_tray(cfg!(
+                    target_os = "macos"
+                )));
                 self.window_hidden = true;
                 self.ensure_tray();
                 if !self.cfg.prefs.tray_notice_shown {
@@ -11519,6 +11571,15 @@ fn main() -> eframe::Result<()> {
         LaunchMode::Maximized => viewport = viewport.with_maximized(true),
         LaunchMode::Normal => {}
     }
+    // App icon (v2.0.6 Mac patch): without this, eframe
+    // substitutes its own default icon and, on macOS, writes it
+    // over the bundle icon in the Dock while running (black
+    // pinwheel). Same artwork as AppIcon.icns, so the Dock icon
+    // no longer changes between running and not. (Also fixes
+    // the Windows taskbar/alt-tab icon the same way.)
+    if let Some(icon) = app_icon_data() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
         viewport,
         // Wgpu (DirectX on Windows, Metal on Mac) instead of the
@@ -14759,6 +14820,41 @@ mod tests {
         // close-to-tray.
         assert_eq!(close_action(true, true), CloseAction::Quit);
         assert_eq!(close_action(false, true), CloseAction::Quit);
+    }
+
+    #[test]
+    fn app_icon_is_the_bundle_artwork() {
+        // The viewport icon must be assets/icon.png (the source
+        // AppIcon.icns is generated from), not eframe's default:
+        // otherwise macOS shows the black pinwheel in the Dock
+        // while running.
+        let icon = app_icon_data().expect("assets/icon.png must decode");
+        assert_eq!(icon.width, 512);
+        assert_eq!(icon.height, 512);
+        assert_eq!(icon.rgba.len(), 512 * 512 * 4);
+    }
+
+    #[test]
+    fn close_to_tray_hide_command_branches() {
+        // macOS minimizes (Dock-click restorable); everywhere
+        // else orders out, as before.
+        assert_eq!(
+            hide_command_for_close_to_tray(true),
+            egui::ViewportCommand::Minimized(true)
+        );
+        assert_eq!(
+            hide_command_for_close_to_tray(false),
+            egui::ViewportCommand::Visible(false)
+        );
+    }
+
+    #[test]
+    fn hidden_flag_syncs_only_on_real_focus() {
+        assert!(!sync_hidden_with_focus(true, Some(true)));
+        assert!(sync_hidden_with_focus(true, Some(false)));
+        assert!(sync_hidden_with_focus(true, None));
+        assert!(!sync_hidden_with_focus(false, Some(true)));
+        assert!(!sync_hidden_with_focus(false, None));
     }
 
     #[test]
