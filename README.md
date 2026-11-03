@@ -151,6 +151,27 @@ instructions below.)
   and sync activity," since the log covers Tuya sync lines too,
   not just thermostat operations.
 
+### Patched 2.0.6 (same version — the release files were updated in place, no new release)
+
+- **Maximized launches remember their monitor (Windows).** The
+  launch check's clock used to start before a sleeping display
+  had even appeared, and monitors were identified only by a
+  number Windows can reshuffle across boots. The clock now
+  starts once the target display first appears, and the monitor
+  is identified by name and orientation too. Field-verified.
+- **The thermostat recovers when its network address changes.**
+  The app used to pin the address from pairing time forever, so
+  a new address meant refused connections until re-pairing. On
+  a connect failure it now looks the thermostat up by name, and
+  if it answers from a new address, updates the saved address
+  and retries — no re-pairing. Field-verified on Windows.
+- **Mac Dock icon and Dock-click restore (Mac).** The Dock icon
+  no longer turns into the framework's default glyph while the
+  app runs — the app now supplies its own house artwork. And
+  closing to the menu bar now minimizes instead of hiding, so
+  a plain Dock click brings the window back instead of
+  requiring Quit and reopen.
+
 ## What's new in 2.0.5
 
 - **The manual Refresh button is gone.** Autorefresh is now the only
