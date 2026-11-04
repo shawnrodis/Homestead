@@ -139,6 +139,22 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 2.0.8
+
+- **Native camera tiles now pace by the camera's own clock —
+  as smooth as VLC.** The tile reads each frame's true
+  timestamp from the stream and shows it at its own time,
+  instead of at even intervals the app invented. That was
+  the last systematic difference from VLC: bursty delivery
+  used to play back bursty, no matter how clean the release
+  schedule was. With timestamps, bursts absorb and the
+  picture stays smooth — even with no buffer at all, so
+  the Buffer slider is gone. The even-interval pacer
+  remains as an automatic fallback if timestamps ever fail
+  to arrive. This release also folds in every patched
+  2.0.7 Windows fix, so Windows and Mac are back on the
+  same build.
+
 ## What's new in 2.0.7
 
 - **Camera tiles have a frame-rate switch.** Every camera tile

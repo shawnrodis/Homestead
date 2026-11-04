@@ -191,16 +191,6 @@ struct Camera {
     /// so existing tiles behave exactly as before.
     #[serde(default = "default_cam_fps_mode")]
     fps_mode: String,
-    /// Tile buffer delay in milliseconds (v2.0.7 patch 3):
-    /// only used when the tile is in Native mode — the tile's
-    /// Buffer slider writes this. Old configs load as 1000 ms
-    /// (the VLC-style default).
-    #[serde(default = "default_cam_buffer_ms")]
-    buffer_ms: u32,
-}
-
-fn default_cam_buffer_ms() -> u32 {
-    1000
 }
 
 fn default_cam_fps_mode() -> String {
@@ -3151,14 +3141,6 @@ fn pump_source_key(ffmpeg: &Path, url: &str, w: usize, h: usize, native_fps: boo
     )
 }
 
-/// VLC-style buffer for Native tile pumps (v2.0.7 patch 2): a
-/// frame becomes displayable BUFFER_DELAY after it arrives, so
-/// the tile always plays from ~1 s of held video — the same
-/// cushion VLC's network cache gives it. Delivery stalls up to
-/// ~1 s play through from the buffer instead of freezing the
-/// tile; longer stalls re-buffer for ~1 s once the stream
-/// resumes, exactly like VLC.
-const BUFFER_DELAY: Duration = Duration::from_millis(1000);
 /// Fastest the buffer releases: one frame per 33 ms (~30 fps
 /// ceiling). The normal release spacing is the stream's own
 /// measured interval (estimate_interval), so a 15 fps camera
@@ -3586,9 +3568,10 @@ struct Pump {
     /// (estimate_interval, held across stalls so playback
     /// doesn't speed up when arrivals pause).
     interval: Duration,
-    /// The tile's Buffer slider value, refreshed from the
-    /// camera record every drain pass — so moving the slider
-    /// retunes the release clock live with no pump restart.
+    /// Release cushion for the pacer — always zero since
+    /// v2.0.8: PTS pacing paces by the camera's own
+    /// timestamps, so no buffer cushion is needed (the
+    /// age-drop backstop still adds its 1 s slack on top).
     buffer_delay: Duration,
     /// Arrival times in the last RATE_WINDOW, feeding the
     /// interval estimate.
@@ -3825,7 +3808,7 @@ fn spawn_pump(
         last_pts: None,
         next_show: None,
         interval: MIN_RELEASE_INTERVAL,
-        buffer_delay: BUFFER_DELAY,
+        buffer_delay: Duration::ZERO,
         arrivals: VecDeque::new(),
         stat_window_start: Instant::now(),
         stat_received: 0,
@@ -6665,18 +6648,6 @@ impl App {
         // timestamps, rate metronome as fallback), so bursty
         // delivery plays out evenly instead of reproducing its
         // bursts and holes.
-        // Buffer delays per camera tile, snapshotted before the
-        // drain so the loop can retune each paced pump's clock
-        // without borrowing the config mid-iteration. The
-        // slider writes the record; the pump follows it live
-        // with no restart.
-        let mut delays: HashMap<String, Duration> = HashMap::new();
-        for cam in &self.cfg.cameras {
-            delays.insert(
-                format!("cam:{}", cam.id),
-                Duration::from_millis((cam.buffer_ms as u64).min(5000)),
-            );
-        }
         // Camera names per pump key, for the same reason — the
         // instrumented summaries log names, not keys.
         let mut names: HashMap<String, String> = HashMap::new();
@@ -6702,11 +6673,6 @@ impl App {
             // accounting below reads it too.
             let now = Instant::now();
             let show: Option<Vec<u8>> = if p.paced {
-                // The tile's Buffer slider retunes this pump's
-                // clock live — no restart when it moves.
-                if let Some(d) = delays.get(k) {
-                    p.buffer_delay = *d;
-                }
                 let had_arrivals = !arrived.is_empty();
                 let arrived_n = arrived.len();
                 if had_arrivals {
@@ -10961,29 +10927,6 @@ impl App {
                         }
                     }
                 });
-                // ---------- buffer (v2.0.7 patch 3) ----------
-                // Native tiles only: how much video the buffer
-                // holds before display. 0 = no buffer (the old
-                // immediate behavior); the pump picks changes
-                // up live, no stream restart. Range extended to
-                // 5 s (patch 4).
-                if cam.fps_mode == "native" {
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Buffer").size(12.5).color(pal.dim));
-                        let mut secs = (cam.buffer_ms as f32 / 1000.0).clamp(0.0, 5.0);
-                        let resp =
-                            ui.add(egui::Slider::new(&mut secs, 0.0..=5.0).step_by(0.25));
-                        ui.label(RichText::new(format!("{:.2} s", secs)).size(12.5).color(pal.dim));
-                        if resp.changed() {
-                            if let Some(ci2) = self.camera_index(id) {
-                                self.cfg.cameras[ci2].buffer_ms =
-                                    (secs * 1000.0).round() as u32;
-                                self.save();
-                            }
-                        }
-                    });
-                }
                 // ---------- actions ----------
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -11846,7 +11789,7 @@ impl App {
                                 "Customising. Sections appear as Cameras, Pinned, Lighting, your groups, Ungrouped, Scenes by default — and in ✎ Edit mode every section header has ↑/↓ buttons to move the section itself; your order sticks. Inside a section, cards sort A–Z by name by default: drag cards into your own order — drag a card by its body and drop it where it belongs, or use the ↑/↓ buttons (that order then sticks, and each section has a “Reset to name order” button) — create groups (rooms), rename devices with an alias, or hide devices you never use. Dragging a card onto another section moves it there. Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section — the device also stays in its group below. Scenes always live in their own Scenes section.",
                                 "Lighting & group controls. Lights organise themselves: any bulb or strip that isn't assigned to one of your groups lives in the built-in Lighting section, and cameras get their own built-in Cameras section the same way — assigning a device to a group always wins over the automatic sections. The Lighting header (and the header of any group containing a light) has group controls: a master switch (on if any member is on; clicking turns the whole group on or off), brightness and colour-temperature sliders showing the members' average, and colour swatches. Group controls broadcast — they send the command to each member in turn, and changing a single light afterwards simply overrides it for that light. Nothing about the group itself is stored.",
                                 "Cameras (RTSP). Tapo cameras: in the Tapo app, open the camera → Settings → Advanced Settings → Camera Account and create a camera account, and make sure RTSP is enabled for the camera. The username and password you add here are that camera account — not your TP-Link cloud account. Then use ✎ Edit → + Add camera and enter the camera's IP address (a fixed or DHCP-reserved IP works best, so the address doesn't change). The app builds the stream address for you: rtsp://user:pass@IP:554/stream1 (high quality) or /stream2 (standard) — or pick “Custom path” for other RTSP cameras. Camera cards live alongside your devices and can be pinned, grouped and reordered the same way; unassigned cameras live in the built-in Cameras section (the first section by default) until you assign them to a group of your own. In Edit mode a camera card can also be resized — Normal (one grid cell), Large (two columns) or Wide (the full row).",
-                                "Watching a stream. This app plays RTSP streams in place: a bundled copy of ffmpeg decodes the feed for the live tile previews (Tapo Stream 2, the standard-quality stream, to keep tiles light — Large tiles decode it bigger, and a Wide tile uses the quality picked on the card) and for the big ▶ Watch player, which uses the quality picked on the card. Each tile has a frame-rate switch: 12 fps keeps the preview light, Native runs it at the camera's own frame rate for a smoother picture, and Native tiles have a Buffer slider (0–5 s) that trades live-ness for stall cover. Tile previews can be turned off in Settings → Stream gateway & cameras, where you can also point the app at a different ffmpeg. If ffmpeg can't be found, previews switch off and ▶ Watch falls back to the external player app named in Settings (VLC by default) — or use Copy URL and paste the address into VLC's “Open Network Stream”. If a stream gateway (go2rtc / MediaMTX) is configured instead, ▶ Watch opens the gateway's watch page in your browser. (The web edition of this app can't decode RTSP itself: with a gateway configured, its tiles embed the gateway's feed; without one, its Watch hands the stream to a player app.)",
+                                "Watching a stream. This app plays RTSP streams in place: a bundled copy of ffmpeg decodes the feed for the live tile previews (Tapo Stream 2, the standard-quality stream, to keep tiles light — Large tiles decode it bigger, and a Wide tile uses the quality picked on the card) and for the big ▶ Watch player, which uses the quality picked on the card. Each tile has a frame-rate switch: 12 fps keeps the preview light, Native runs it at the camera's own frame rate, paced by the camera's own timestamps, for a smoother picture. Tile previews can be turned off in Settings → Stream gateway & cameras, where you can also point the app at a different ffmpeg. If ffmpeg can't be found, previews switch off and ▶ Watch falls back to the external player app named in Settings (VLC by default) — or use Copy URL and paste the address into VLC's “Open Network Stream”. If a stream gateway (go2rtc / MediaMTX) is configured instead, ▶ Watch opens the gateway's watch page in your browser. (The web edition of this app can't decode RTSP itself: with a gateway configured, its tiles embed the gateway's feed; without one, its Watch hands the stream to a player app.)",
                                 "Limits. Tuya rate-limits how often the device list can be fetched and how fast commands can be sent. When that happens the app quietly keeps showing the last known states, retries commands a moment later, and stretches its refresh interval until Tuya is happy again — no action needed. Autorefresh every 30s or slower is comfortable.",
                             ];
                             for p in paras {
@@ -12145,15 +12088,6 @@ impl App {
                         .and_then(|eid| self.camera_index(eid))
                         .map(|ci| self.cfg.cameras[ci].fps_mode.clone())
                         .unwrap_or_else(default_cam_fps_mode),
-                    // Same rule as the frame rate: the edit form
-                    // never touches the buffer, so an edit keeps
-                    // the camera's existing choice.
-                    buffer_ms: form
-                        .id
-                        .as_ref()
-                        .and_then(|eid| self.camera_index(eid))
-                        .map(|ci| self.cfg.cameras[ci].buffer_ms)
-                        .unwrap_or_else(default_cam_buffer_ms),
                 };
                 if let Some(eid) = &form.id {
                     match self.camera_index(eid) {
@@ -12567,7 +12501,6 @@ mod tests {
             template: template.into(),
             path: path.into(),
             fps_mode: default_cam_fps_mode(),
-            buffer_ms: default_cam_buffer_ms(),
         }
     }
 
@@ -13003,7 +12936,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "2.0.7");
+        assert_eq!(APP_VERSION, "2.0.8");
     }
 
     #[test]
@@ -13360,7 +13293,6 @@ mod tests {
         .unwrap();
         assert_eq!(c.fps_mode, "low");
         assert!(!cam_native_fps(&c));
-        assert_eq!(c.buffer_ms, 1000);
     }
 
     #[test]
@@ -13446,7 +13378,7 @@ mod tests {
             last_pts: None,
             next_show: None,
             interval: MIN_RELEASE_INTERVAL,
-            buffer_delay: BUFFER_DELAY,
+            buffer_delay: Duration::ZERO,
             arrivals: VecDeque::new(),
             stat_window_start: Instant::now(),
             stat_received: 0,
@@ -15168,7 +15100,6 @@ mod tests {
             template: "tapo1".into(),
             path: String::new(),
             fps_mode: default_cam_fps_mode(),
-            buffer_ms: default_cam_buffer_ms(),
         };
         let mut cams = vec![mk("1699999999999", "10.0.0.1"), mk("1699999999999", "10.0.0.2"), mk("42", "10.0.0.3")];
         let mut layout = LayoutCfg::default();
