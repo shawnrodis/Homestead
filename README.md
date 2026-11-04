@@ -139,6 +139,16 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 2.0.7
+
+- **Camera tiles have a frame-rate switch.** Every camera tile
+  now has a 12 fps / Native toggle. 12 fps is the default, as
+  before — light on CPU. Native runs the tile at the camera's
+  own frame rate, so the picture is noticeably smoother (like
+  the external player), at the cost of more CPU. The choice is
+  saved per camera and survives restarts. The ▶ Watch player
+  still uses 12 fps.
+
 ## What's new in 2.0.6
 
 - **The refresh rate now adjusts itself.** The fixed interval

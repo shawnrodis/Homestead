@@ -185,6 +185,22 @@ struct Camera {
     template: String,
     #[serde(default)]
     path: String,
+    /// Tile preview frame rate (v2.0.7): "low" (12 fps, the
+    /// default — cheap) or "native" (the stream's own frame
+    /// rate — smoother, more CPU). Old configs load as "low",
+    /// so existing tiles behave exactly as before.
+    #[serde(default = "default_cam_fps_mode")]
+    fps_mode: String,
+}
+
+fn default_cam_fps_mode() -> String {
+    "low".to_string()
+}
+
+/// True when a camera's tile preview runs at the stream's native
+/// frame rate instead of the capped 12 fps (v2.0.7).
+fn cam_native_fps(cam: &Camera) -> bool {
+    cam.fps_mode == "native"
 }
 
 fn default_rtsp_port() -> u16 {
@@ -2845,9 +2861,23 @@ fn frame_bytes(w: usize, h: usize) -> usize {
 }
 
 /// ffmpeg arguments for the frame pump: TCP RTSP in, scaled + padded
-/// to exactly w×h at 12 fps, raw RGBA frames on stdout. The URL (with
-/// credentials) travels as a single argv — never through a shell.
-fn ffmpeg_args(url: &str, w: usize, h: usize) -> Vec<String> {
+/// to exactly w×h, raw RGBA frames on stdout. Low mode caps the
+/// output at 12 fps (cheap tile previews); native mode drops the
+/// fps filter so the tile runs at the stream's own frame rate.
+/// The URL (with credentials) travels as a single argv — never
+/// through a shell.
+fn ffmpeg_args(url: &str, w: usize, h: usize, native_fps: bool) -> Vec<String> {
+    let vf = if native_fps {
+        format!(
+            "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2",
+            w, h, w, h
+        )
+    } else {
+        format!(
+            "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,fps=12",
+            w, h, w, h
+        )
+    };
     vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -2857,10 +2887,7 @@ fn ffmpeg_args(url: &str, w: usize, h: usize) -> Vec<String> {
         "-i".to_string(),
         url.to_string(),
         "-vf".to_string(),
-        format!(
-            "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,fps=12",
-            w, h, w, h
-        ),
+        vf,
         "-f".to_string(),
         "rawvideo".to_string(),
         "-pix_fmt".to_string(),
@@ -3088,9 +3115,17 @@ fn play_pause_chip(ui: &mut Ui, id: &str, rect: egui::Rect, paused: bool) -> egu
 }
 
 /// Identity of one pump's feed — when it changes (camera edited,
-/// quality switched, ffmpeg moved) the pump is restarted.
-fn pump_source_key(ffmpeg: &Path, url: &str, w: usize, h: usize) -> String {
-    format!("{}|{}|{}x{}", ffmpeg.display(), url, w, h)
+/// quality switched, frame rate toggled, ffmpeg moved) the pump is
+/// restarted.
+fn pump_source_key(ffmpeg: &Path, url: &str, w: usize, h: usize, native_fps: bool) -> String {
+    format!(
+        "{}|{}|{}x{}|{}",
+        ffmpeg.display(),
+        url,
+        w,
+        h,
+        if native_fps { "native" } else { "low" }
+    )
 }
 
 /// One running (or backing-off) frame pump, owned by the UI thread.
@@ -3160,6 +3195,7 @@ fn spawn_pump(
     url: &str,
     w: usize,
     h: usize,
+    native_fps: bool,
     source_key: String,
     ctx: &egui::Context,
 ) -> Pump {
@@ -3174,7 +3210,7 @@ fn spawn_pump(
         let url = url.to_string();
         thread::spawn(move || {
             let mut cmd = Command::new(&ff);
-            cmd.args(ffmpeg_args(&url, w, h))
+            cmd.args(ffmpeg_args(&url, w, h, native_fps))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -5972,7 +6008,7 @@ impl App {
     fn sync_pumps(&mut self, ctx: &egui::Context) {
         let ff = self.ffmpeg_path();
         let mut desired: HashMap<String, String> = HashMap::new(); // key -> source key
-        let mut specs: HashMap<String, (String, usize, usize)> = HashMap::new(); // key -> (url, w, h)
+        let mut specs: HashMap<String, (String, usize, usize, bool)> = HashMap::new(); // key -> (url, w, h, native_fps)
         if let Some(ffp) = &ff {
             for cam in &self.cfg.cameras {
                 let item = format!("cam:{}", cam.id);
@@ -5986,14 +6022,16 @@ impl App {
                     // The tile pump follows the card's size (v1.2.1):
                     // Normal 480×270 SD, Large 960×540 SD, Wide
                     // 960×540 at the card's selected quality. The
-                    // source key includes url+w+h+gen, so a resize
-                    // or an edit restarts the pump on its own.
+                    // source key includes url+w+h+fps+gen, so a resize,
+                    // a frame-rate toggle, or an edit restarts the
+                    // pump on its own.
                     let (url, w, h) = tile_feed(cam, cam_size_of(&self.cfg.layout, &item));
+                    let native = cam_native_fps(cam);
                     desired.insert(
                         item.clone(),
-                        format!("{}|g{}", pump_source_key(ffp, &url, w, h), gen),
+                        format!("{}|g{}", pump_source_key(ffp, &url, w, h, native), gen),
                     );
-                    specs.insert(item, (url, w, h));
+                    specs.insert(item, (url, w, h, native));
                 }
             }
             if let Some(item) = &self.player_for {
@@ -6005,11 +6043,11 @@ impl App {
                         "player".to_string(),
                         format!(
                             "{}|g{}",
-                            pump_source_key(ffp, &url, PLAYER_W, PLAYER_H),
+                            pump_source_key(ffp, &url, PLAYER_W, PLAYER_H, false),
                             gen
                         ),
                     );
-                    specs.insert("player".to_string(), (url, PLAYER_W, PLAYER_H));
+                    specs.insert("player".to_string(), (url, PLAYER_W, PLAYER_H, false));
                 }
             }
         }
@@ -6049,9 +6087,9 @@ impl App {
                 match pump_action(state, matches, force, due) {
                     PumpAction::Keep => {}
                     action => {
-                        if let Some((url, w, h)) = specs.get(k) {
+                        if let Some((url, w, h, native)) = specs.get(k) {
                             let mut np =
-                                spawn_pump(ffp, url, *w, *h, want.clone(), ctx);
+                                spawn_pump(ffp, url, *w, *h, *native, want.clone(), ctx);
                             if let Some(mut old) = self.pumps.remove(k) {
                                 if action == PumpAction::RetryDue {
                                     np.streak = old.streak;
@@ -10065,6 +10103,44 @@ impl App {
                         }
                     });
                 }
+                // ---------- frame rate (v2.0.7) ----------
+                // Segmented like the quality switch above, but for
+                // every camera: the tile preview at 12 fps (light)
+                // or at the stream's native frame rate (smoother,
+                // more CPU). The choice is stored on the camera
+                // record, so it survives restarts; flipping it
+                // restarts the tile's pump via the source key.
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Frame rate").size(12.5).color(pal.dim));
+                    for (mode, label, tip) in [
+                        (
+                            "low",
+                            "12 fps",
+                            "Tile preview at 12 fps — light on CPU",
+                        ),
+                        (
+                            "native",
+                            "Native",
+                            "Tile preview at the camera's own frame rate — smoother, more CPU",
+                        ),
+                    ] {
+                        let active = cam.fps_mode == mode;
+                        let btn = if active {
+                            Button::new(RichText::new(label).color(Color32::WHITE))
+                                .fill(accent)
+                                .small()
+                        } else {
+                            Button::new(label).small()
+                        };
+                        if ui.add(btn).on_hover_text(tip).clicked() && !active {
+                            if let Some(ci2) = self.camera_index(id) {
+                                self.cfg.cameras[ci2].fps_mode = mode.to_string();
+                                self.save();
+                            }
+                        }
+                    }
+                });
                 // ---------- actions ----------
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -10927,7 +11003,7 @@ impl App {
                                 "Customising. Sections appear as Cameras, Pinned, Lighting, your groups, Ungrouped, Scenes by default — and in ✎ Edit mode every section header has ↑/↓ buttons to move the section itself; your order sticks. Inside a section, cards sort A–Z by name by default: drag cards into your own order — drag a card by its body and drop it where it belongs, or use the ↑/↓ buttons (that order then sticks, and each section has a “Reset to name order” button) — create groups (rooms), rename devices with an alias, or hide devices you never use. Dragging a card onto another section moves it there. Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section — the device also stays in its group below. Scenes always live in their own Scenes section.",
                                 "Lighting & group controls. Lights organise themselves: any bulb or strip that isn't assigned to one of your groups lives in the built-in Lighting section, and cameras get their own built-in Cameras section the same way — assigning a device to a group always wins over the automatic sections. The Lighting header (and the header of any group containing a light) has group controls: a master switch (on if any member is on; clicking turns the whole group on or off), brightness and colour-temperature sliders showing the members' average, and colour swatches. Group controls broadcast — they send the command to each member in turn, and changing a single light afterwards simply overrides it for that light. Nothing about the group itself is stored.",
                                 "Cameras (RTSP). Tapo cameras: in the Tapo app, open the camera → Settings → Advanced Settings → Camera Account and create a camera account, and make sure RTSP is enabled for the camera. The username and password you add here are that camera account — not your TP-Link cloud account. Then use ✎ Edit → + Add camera and enter the camera's IP address (a fixed or DHCP-reserved IP works best, so the address doesn't change). The app builds the stream address for you: rtsp://user:pass@IP:554/stream1 (high quality) or /stream2 (standard) — or pick “Custom path” for other RTSP cameras. Camera cards live alongside your devices and can be pinned, grouped and reordered the same way; unassigned cameras live in the built-in Cameras section (the first section by default) until you assign them to a group of your own. In Edit mode a camera card can also be resized — Normal (one grid cell), Large (two columns) or Wide (the full row).",
-                                "Watching a stream. This app plays RTSP streams in place: a bundled copy of ffmpeg decodes the feed for the live tile previews (Tapo Stream 2, the standard-quality stream, to keep tiles light — Large tiles decode it bigger, and a Wide tile uses the quality picked on the card) and for the big ▶ Watch player, which uses the quality picked on the card. Tile previews can be turned off in Settings → Stream gateway & cameras, where you can also point the app at a different ffmpeg. If ffmpeg can't be found, previews switch off and ▶ Watch falls back to the external player app named in Settings (VLC by default) — or use Copy URL and paste the address into VLC's “Open Network Stream”. If a stream gateway (go2rtc / MediaMTX) is configured instead, ▶ Watch opens the gateway's watch page in your browser. (The web edition of this app can't decode RTSP itself: with a gateway configured, its tiles embed the gateway's feed; without one, its Watch hands the stream to a player app.)",
+                                "Watching a stream. This app plays RTSP streams in place: a bundled copy of ffmpeg decodes the feed for the live tile previews (Tapo Stream 2, the standard-quality stream, to keep tiles light — Large tiles decode it bigger, and a Wide tile uses the quality picked on the card) and for the big ▶ Watch player, which uses the quality picked on the card. Each tile has a frame-rate switch: 12 fps keeps the preview light, Native runs it at the camera's own frame rate for a smoother picture. Tile previews can be turned off in Settings → Stream gateway & cameras, where you can also point the app at a different ffmpeg. If ffmpeg can't be found, previews switch off and ▶ Watch falls back to the external player app named in Settings (VLC by default) — or use Copy URL and paste the address into VLC's “Open Network Stream”. If a stream gateway (go2rtc / MediaMTX) is configured instead, ▶ Watch opens the gateway's watch page in your browser. (The web edition of this app can't decode RTSP itself: with a gateway configured, its tiles embed the gateway's feed; without one, its Watch hands the stream to a player app.)",
                                 "Limits. Tuya rate-limits how often the device list can be fetched and how fast commands can be sent. When that happens the app quietly keeps showing the last known states, retries commands a moment later, and stretches its refresh interval until Tuya is happy again — no action needed. Autorefresh every 30s or slower is comfortable.",
                             ];
                             for p in paras {
@@ -11217,6 +11293,15 @@ impl App {
                     port,
                     template: form.template.clone(),
                     path: form.path.trim().to_string(),
+                    // The edit form never touches the frame rate,
+                    // so an edit keeps the camera's existing choice
+                    // instead of resetting it to the default.
+                    fps_mode: form
+                        .id
+                        .as_ref()
+                        .and_then(|eid| self.camera_index(eid))
+                        .map(|ci| self.cfg.cameras[ci].fps_mode.clone())
+                        .unwrap_or_else(default_cam_fps_mode),
                 };
                 if let Some(eid) = &form.id {
                     match self.camera_index(eid) {
@@ -11617,6 +11702,7 @@ mod tests {
             port: 554,
             template: template.into(),
             path: path.into(),
+            fps_mode: default_cam_fps_mode(),
         }
     }
 
@@ -12052,7 +12138,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "2.0.6");
+        assert_eq!(APP_VERSION, "2.0.7");
     }
 
     #[test]
@@ -12125,7 +12211,7 @@ mod tests {
     #[test]
     fn ffmpeg_args_and_frame_sizes() {
         let url = "rtsp://u:p@192.168.1.50:554/stream2";
-        let args = ffmpeg_args(url, TILE_W, TILE_H);
+        let args = ffmpeg_args(url, TILE_W, TILE_H, false);
         // The URL travels as ONE argv right after -i (never a shell).
         let ipos = args.iter().position(|a| a == "-i").unwrap();
         assert_eq!(args[ipos + 1], url);
@@ -12137,12 +12223,61 @@ mod tests {
             tail,
             ["-f", "rawvideo", "-pix_fmt", "rgba", "-"]
         );
-        let pargs = ffmpeg_args(url, PLAYER_W, PLAYER_H);
+        let pargs = ffmpeg_args(url, PLAYER_W, PLAYER_H, false);
         assert!(pargs.iter().any(|a| a.contains("scale=960:540")));
         // Exact raw-frame sizes the pump reads.
         assert_eq!(frame_bytes(TILE_W, TILE_H), 518_400);
         assert_eq!(frame_bytes(PLAYER_W, PLAYER_H), 2_073_600);
         assert_eq!(frame_bytes(2, 3), 24);
+    }
+
+    #[test]
+    fn ffmpeg_args_native_drops_the_fps_cap() {
+        // v2.0.7: the tile's Native mode runs at the stream's own
+        // frame rate — the fps filter is gone, scale/pad stay.
+        let url = "rtsp://u:p@192.168.1.50:554/stream2";
+        let args = ffmpeg_args(url, TILE_W, TILE_H, true);
+        assert!(!args.iter().any(|a| a.contains("fps=")));
+        assert!(args.iter().any(|a| a
+            == "scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2"));
+        // And the low mode still caps, so the toggle has two
+        // genuinely different feeds.
+        let low = ffmpeg_args(url, TILE_W, TILE_H, false);
+        assert!(low.iter().any(|a| a.contains("fps=12")));
+    }
+
+    #[test]
+    fn pump_source_key_includes_frame_rate() {
+        // v2.0.7: flipping the tile's frame rate must restart the
+        // pump — the mode rides in the source key, so no separate
+        // generation bump is needed for the toggle.
+        let ff = Path::new("/app/ffmpeg");
+        let url = "rtsp://u:p@192.168.1.50:554/stream2";
+        let low = pump_source_key(ff, url, TILE_W, TILE_H, false);
+        let native = pump_source_key(ff, url, TILE_W, TILE_H, true);
+        assert_ne!(low, native);
+        assert_eq!(low, pump_source_key(ff, url, TILE_W, TILE_H, false));
+        assert!(low.ends_with("|low"));
+        assert!(native.ends_with("|native"));
+    }
+
+    #[test]
+    fn old_camera_config_loads_as_low_fps() {
+        // v2.0.7: configs written before the toggle carry no
+        // fps_mode — they must load as the old behavior (12 fps),
+        // not as native.
+        let c: Camera = serde_json::from_value(json!({
+            "id": "1",
+            "name": "Porch",
+            "user": "u",
+            "password": "p",
+            "host": "192.168.1.50",
+            "template": "tapo2",
+            "path": ""
+        }))
+        .unwrap();
+        assert_eq!(c.fps_mode, "low");
+        assert!(!cam_native_fps(&c));
     }
 
     #[test]
@@ -13920,6 +14055,7 @@ mod tests {
             port: 554,
             template: "tapo1".into(),
             path: String::new(),
+            fps_mode: default_cam_fps_mode(),
         };
         let mut cams = vec![mk("1699999999999", "10.0.0.1"), mk("1699999999999", "10.0.0.2"), mk("42", "10.0.0.3")];
         let mut layout = LayoutCfg::default();
