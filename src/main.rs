@@ -3170,11 +3170,13 @@ const RATE_WINDOW: Duration = Duration::from_secs(5);
 /// (Dropping the oldest instead froze tiles whenever the
 /// delay exceeded the cap's capacity: no frame lived long
 /// enough to become due.)
-fn pacer_push(queue: &mut VecDeque<(Instant, Vec<u8>)>, frame: (Instant, Vec<u8>), max: usize) {
+/// Returns false when the frame was refused at the cap.
+fn pacer_push(queue: &mut VecDeque<(Instant, Vec<u8>)>, frame: (Instant, Vec<u8>), max: usize) -> bool {
     if queue.len() >= max {
-        return;
+        return false;
     }
     queue.push_back(frame);
+    true
 }
 
 /// Drop arrival timestamps older than the rate window, so the
@@ -3245,11 +3247,13 @@ fn buffer_queue_cap(buffer_delay: Duration) -> usize {
 /// state the second frame is never due yet, so this drops
 /// nothing; after a hitch it jumps straight to the frame that
 /// should be showing now, and the stream stays on time.
+/// Returns how many frames were dropped.
 fn drop_stale_fronts(
     queue: &mut VecDeque<(Instant, Vec<u8>)>,
     now: Instant,
     delay: Duration,
-) {
+) -> usize {
+    let mut dropped = 0;
     while queue.len() > 1 {
         let second_due = queue
             .get(1)
@@ -3257,10 +3261,12 @@ fn drop_stale_fronts(
             .unwrap_or(false);
         if second_due {
             queue.pop_front();
+            dropped += 1;
         } else {
             break;
         }
     }
+    dropped
 }
 
 /// One running (or backing-off) frame pump, owned by the UI thread.
@@ -3304,6 +3310,22 @@ struct Pump {
     /// Arrival times in the last RATE_WINDOW, feeding the
     /// interval estimate.
     arrivals: VecDeque<Instant>,
+    /// Timing diagnostics (instrumented patch): per-window
+    /// counters summarized to the diagnostics log every 10 s,
+    /// so a felt stutter can be matched to releases, drops,
+    /// or arrival gaps instead of guessed at. Maxima reset
+    /// each window; last_* persist so no gap is lost across
+    /// a flush boundary.
+    stat_window_start: Instant,
+    stat_received: u64,
+    stat_shown: u64,
+    stat_cap_dropped: u64,
+    stat_late_dropped: u64,
+    stat_max_release_gap_ms: u64,
+    stat_last_show: Option<Instant>,
+    stat_max_arrival_gap_ms: u64,
+    stat_last_arrival: Option<Instant>,
+    stat_max_queue: usize,
 }
 
 impl Pump {
@@ -3490,6 +3512,16 @@ fn spawn_pump(
         interval: MIN_RELEASE_INTERVAL,
         buffer_delay: BUFFER_DELAY,
         arrivals: VecDeque::new(),
+        stat_window_start: Instant::now(),
+        stat_received: 0,
+        stat_shown: 0,
+        stat_cap_dropped: 0,
+        stat_late_dropped: 0,
+        stat_max_release_gap_ms: 0,
+        stat_last_show: None,
+        stat_max_arrival_gap_ms: 0,
+        stat_last_arrival: None,
+        stat_max_queue: 0,
     }
 }
 
@@ -6304,6 +6336,12 @@ impl App {
                 Duration::from_millis((cam.buffer_ms as u64).min(5000)),
             );
         }
+        // Camera names per pump key, for the same reason — the
+        // instrumented summaries log names, not keys.
+        let mut names: HashMap<String, String> = HashMap::new();
+        for cam in &self.cfg.cameras {
+            names.insert(format!("cam:{}", cam.id), cam.name.clone());
+        }
         let mut any_active = false;
         let mut next_retry: Option<Instant> = None;
         let mut next_wake: Option<Instant> = None;
@@ -6326,9 +6364,23 @@ impl App {
                 }
                 let now = Instant::now();
                 let had_arrivals = !arrived.is_empty();
+                let arrived_n = arrived.len();
+                if had_arrivals {
+                    if let Some(last) = p.stat_last_arrival {
+                        let gap_ms = now.duration_since(last).as_millis() as u64;
+                        p.stat_max_arrival_gap_ms = p.stat_max_arrival_gap_ms.max(gap_ms);
+                    }
+                    p.stat_last_arrival = Some(now);
+                }
                 for f in arrived {
-                    pacer_push(&mut p.queue, (now, f), buffer_queue_cap(p.buffer_delay));
+                    if !pacer_push(&mut p.queue, (now, f), buffer_queue_cap(p.buffer_delay)) {
+                        p.stat_cap_dropped += 1;
+                    }
                     p.arrivals.push_back(now);
+                }
+                p.stat_received += arrived_n as u64;
+                if p.queue.len() > p.stat_max_queue {
+                    p.stat_max_queue = p.queue.len();
                 }
                 prune_arrivals(&mut p.arrivals, now, RATE_WINDOW);
                 if had_arrivals {
@@ -6342,7 +6394,8 @@ impl App {
                 // it instead of playing catch-up one old frame
                 // at a time. In steady state the second frame is
                 // never due yet, so this drops nothing.
-                drop_stale_fronts(&mut p.queue, now, p.buffer_delay);
+                p.stat_late_dropped +=
+                    drop_stale_fronts(&mut p.queue, now, p.buffer_delay) as u64;
                 let front_arrival = p.queue.front().map(|(t, _)| *t);
                 match front_arrival {
                     Some(t) => {
@@ -6356,6 +6409,13 @@ impl App {
                             // jitter can't accumulate into the
                             // display cadence.
                             p.prev_sched = Some(due);
+                            if let Some(ls) = p.stat_last_show {
+                                let gap_ms = now.duration_since(ls).as_millis() as u64;
+                                p.stat_max_release_gap_ms =
+                                    p.stat_max_release_gap_ms.max(gap_ms);
+                            }
+                            p.stat_last_show = Some(now);
+                            p.stat_shown += 1;
                             p.queue.pop_front().map(|(_, f)| f)
                         } else {
                             None
@@ -6401,6 +6461,30 @@ impl App {
                     let wake = next_release_time(*t, p.prev_sched, p.interval, p.buffer_delay);
                     next_wake = Some(next_wake.map(|x: Instant| x.min(wake)).unwrap_or(wake));
                 }
+            }
+            // Instrumented patch: one summary line per paced
+            // pump every 10 s, so a felt stutter can be matched
+            // to releases, drops, or arrival gaps.
+            if p.paced && Instant::now() >= p.stat_window_start + Duration::from_secs(10) {
+                let name = names.get(k).map(|s| s.as_str()).unwrap_or(k.as_str());
+                crate::hap::tstat_log(&format!(
+                    "camera {name}: 10 s — {} arrived, {} shown, {} cap-dropped, {} late-dropped, max release gap {} ms, max arrival gap {} ms, max queue {}",
+                    p.stat_received,
+                    p.stat_shown,
+                    p.stat_cap_dropped,
+                    p.stat_late_dropped,
+                    p.stat_max_release_gap_ms,
+                    p.stat_max_arrival_gap_ms,
+                    p.stat_max_queue,
+                ));
+                p.stat_window_start = Instant::now();
+                p.stat_received = 0;
+                p.stat_shown = 0;
+                p.stat_cap_dropped = 0;
+                p.stat_late_dropped = 0;
+                p.stat_max_release_gap_ms = 0;
+                p.stat_max_arrival_gap_ms = 0;
+                p.stat_max_queue = 0;
             }
         }
         if any_active {
@@ -12566,9 +12650,13 @@ mod tests {
         // enough to become due.)
         let now = Instant::now();
         let mut q: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
+        let mut refused = 0;
         for i in 0..(PACER_MAX_QUEUE + 2) {
-            pacer_push(&mut q, (now, vec![i as u8]), PACER_MAX_QUEUE);
+            if !pacer_push(&mut q, (now, vec![i as u8]), PACER_MAX_QUEUE) {
+                refused += 1;
+            }
         }
+        assert_eq!(refused, 2);
         assert_eq!(q.len(), PACER_MAX_QUEUE);
         let kept: Vec<u8> = q.iter().map(|(_, f)| f[0]).collect();
         assert_eq!(kept[0], 0);
@@ -12597,11 +12685,14 @@ mod tests {
         q.push_back((base + Duration::from_millis(45), vec![1]));
         q.push_back((base + Duration::from_millis(90), vec![2]));
         // Front due now, second due one interval from now.
-        drop_stale_fronts(&mut q, base + delay, delay);
+        assert_eq!(drop_stale_fronts(&mut q, base + delay, delay), 0);
         assert_eq!(q.len(), 3);
         // Two intervals later both the front and the second
         // are due: the drop jumps to the newest due frame.
-        drop_stale_fronts(&mut q, base + delay + Duration::from_millis(90), delay);
+        assert_eq!(
+            drop_stale_fronts(&mut q, base + delay + Duration::from_millis(90), delay),
+            2
+        );
         assert_eq!(q.len(), 1);
         assert_eq!(q.front().unwrap().1[0], 2);
     }
@@ -12773,6 +12864,16 @@ mod tests {
             interval: MIN_RELEASE_INTERVAL,
             buffer_delay: BUFFER_DELAY,
             arrivals: VecDeque::new(),
+            stat_window_start: Instant::now(),
+            stat_received: 0,
+            stat_shown: 0,
+            stat_cap_dropped: 0,
+            stat_late_dropped: 0,
+            stat_max_release_gap_ms: 0,
+            stat_last_show: None,
+            stat_max_arrival_gap_ms: 0,
+            stat_last_arrival: None,
+            stat_max_queue: 0,
         };
         // Connecting --frame--> Live, streak reset.
         p.note_frame();
