@@ -2877,9 +2877,15 @@ fn frame_bytes(w: usize, h: usize) -> usize {
 /// The URL (with credentials) travels as a single argv — never
 /// through a shell.
 fn ffmpeg_args(url: &str, w: usize, h: usize, native_fps: bool) -> Vec<String> {
+    // Native (paced) pumps run PTS pacing: the filter logs each
+    // frame's stream timestamp (showinfo), ffmpeg passes frames
+    // through unmodified (vsync passthrough — no dup/drop, so
+    // timestamp lines pair 1:1 with output frames), and the log
+    // level rises to info so those lines reach stderr. Low
+    // pumps keep the old error-only, fps-capped feed exactly.
     let vf = if native_fps {
         format!(
-            "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2",
+            "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,showinfo",
             w, h, w, h
         )
     } else {
@@ -2888,22 +2894,29 @@ fn ffmpeg_args(url: &str, w: usize, h: usize, native_fps: bool) -> Vec<String> {
             w, h, w, h
         )
     };
-    vec![
+    let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
-        "error".to_string(),
+        if native_fps { "info" } else { "error" }.to_string(),
         "-rtsp_transport".to_string(),
         "tcp".to_string(),
         "-i".to_string(),
         url.to_string(),
         "-vf".to_string(),
         vf,
+    ];
+    if native_fps {
+        args.push("-vsync".to_string());
+        args.push("0".to_string());
+    }
+    args.extend([
         "-f".to_string(),
         "rawvideo".to_string(),
         "-pix_fmt".to_string(),
         "rgba".to_string(),
         "-".to_string(),
-    ]
+    ]);
+    args
 }
 
 /// The bundled ffmpeg's file name for a macOS architecture
@@ -3177,7 +3190,7 @@ const MAX_AGE_SLACK: Duration = Duration::from_millis(1000);
 /// delay exceeded the cap's capacity: no frame lived long
 /// enough to become due.)
 /// Returns false when the frame was refused at the cap.
-fn pacer_push(queue: &mut VecDeque<(Instant, Vec<u8>)>, frame: (Instant, Vec<u8>), max: usize) -> bool {
+fn pacer_push(queue: &mut VecDeque<QueuedFrame>, frame: QueuedFrame, max: usize) -> bool {
     if queue.len() >= max {
         return false;
     }
@@ -3274,14 +3287,14 @@ fn buffer_queue_cap(buffer_delay: Duration) -> usize {
     frames.max(PACER_MAX_QUEUE)
 }
 
-/// Age drop (rate pacer backstop): while the front frame is
+/// Age drop (both pacers' backstop): while the front frame is
 /// older than the buffer delay plus slack, drop it — live
 /// latency stays bounded when the pacer falls behind
 /// arrivals. Always keeps at least one frame: an over-age
 /// single frame still shows (stale video beats a blank tile).
 /// Returns how many frames were dropped.
 fn drop_too_old(
-    queue: &mut VecDeque<(Instant, Vec<u8>)>,
+    queue: &mut VecDeque<QueuedFrame>,
     now: Instant,
     max_age: Duration,
 ) -> usize {
@@ -3289,7 +3302,7 @@ fn drop_too_old(
     while queue.len() > 1 {
         let too_old = queue
             .front()
-            .map(|(t, _)| *t + max_age < now)
+            .map(|qf| qf.arrival + max_age < now)
             .unwrap_or(false);
         if too_old {
             queue.pop_front();
@@ -3299,6 +3312,232 @@ fn drop_too_old(
         }
     }
     dropped
+}
+
+/// How long a queued frame waits for its timestamp line
+/// before the drain interpolates one (the stderr and stdout
+/// threads run independently, so a line can lag its frame;
+/// past the grace period the line is treated as lost).
+const PTS_GRACE: Duration = Duration::from_millis(500);
+/// Frames queued without any timestamp before the drain gives
+/// up on PTS pacing for this pump and falls back to the rate
+/// pacer (showinfo missing or unparsable).
+const PTS_FALLBACK_FRAMES: usize = 25;
+/// A timestamp this far behind the anchor means the camera's
+/// clock wrapped (or restarted) — re-anchor instead of
+/// playing the old epoch's frames out of order.
+const PTS_WRAP_SECS: f64 = 60.0;
+/// How far past the cushion the earliest frame may be due
+/// before the schedule is judged to have run ahead of reality
+/// (camera clock jumped) and the anchor shifts to remove the
+/// wait. Relative spacing is preserved, so no content is
+/// skipped, only the wait.
+const PTS_LAG_SLACK: Duration = Duration::from_secs(3);
+
+/// One queued frame with its stream timestamp (PTS pacing):
+/// `pts` is the camera's own clock for this frame in seconds
+/// (ffmpeg's showinfo log); None while its timestamp line
+/// hasn't arrived yet — filled from the PTS channel, or
+/// interpolated if the line never comes.
+struct QueuedFrame {
+    arrival: Instant,
+    seq: u64,
+    pts: Option<f64>,
+    data: Vec<u8>,
+}
+
+/// Parse one ffmpeg showinfo stderr line into (frame number,
+/// stream time in seconds). showinfo lines look like:
+/// `[Parsed_showinfo_0_2 @ 0x...] n:   0 pts:  123456 pts_time: 1.234567 ...`
+/// Token-based, so filter names, addresses, and spacing
+/// variations don't matter; anything else → None.
+fn parse_showinfo_pts(line: &str) -> Option<(u64, f64)> {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let mut n = None;
+    let mut pts_time = None;
+    let mut i = 0;
+    while i + 1 < toks.len() {
+        match toks[i] {
+            "n:" => n = toks[i + 1].parse::<u64>().ok(),
+            "pts_time:" => pts_time = toks[i + 1].parse::<f64>().ok(),
+            _ => {}
+        }
+        i += 1;
+    }
+    match (n, pts_time) {
+        (Some(n), Some(p)) => Some((n, p)),
+        _ => None,
+    }
+}
+
+/// Wall-clock show time for a stream time under a PTS anchor:
+/// show_time(pts) = wall0 + (pts - pts0). Negative offsets
+/// are real (a B-frame's presentation time can precede the
+/// anchor frame's), so they subtract instead of clamping.
+fn pts_show_time(pts0: f64, wall0: Instant, pts: f64) -> Instant {
+    let off = pts - pts0;
+    if off >= 0.0 {
+        wall0 + Duration::from_secs_f64(off)
+    } else {
+        wall0 - Duration::from_secs_f64(-off)
+    }
+}
+
+/// PTS release choice: among timestamped queued frames, the
+/// one with the smallest stream time (presentation order —
+/// this is what reorders B-frames, whose decode order differs
+/// from presentation order) and its show time. Frames still
+/// awaiting timestamps are skipped, not guessed at. None
+/// when no queued frame has a timestamp yet.
+fn pts_next_show(
+    frames: &VecDeque<QueuedFrame>,
+    anchor: (f64, Instant),
+) -> Option<(usize, Instant)> {
+    let (pts0, wall0) = anchor;
+    let mut best: Option<(usize, f64)> = None;
+    for (i, f) in frames.iter().enumerate() {
+        if let Some(p) = f.pts {
+            if best.map(|(_, bp)| p < bp).unwrap_or(true) {
+                best = Some((i, p));
+            }
+        }
+    }
+    best.map(|(i, p)| (i, pts_show_time(pts0, wall0, p)))
+}
+
+/// Rate-fallback release (previous behavior, unchanged): the
+/// metronome from rate_pacer_decide, front of queue. The age
+/// drop runs before this in the drain, shared by both pacers.
+fn rate_show_step(p: &mut Pump, now: Instant) -> Option<Vec<u8>> {
+    match p.queue.front().map(|qf| qf.arrival) {
+        None => {
+            p.next_show = None;
+            None
+        }
+        Some(front_arrival) => {
+            let (show_it, next) = rate_pacer_decide(
+                p.next_show,
+                front_arrival,
+                p.buffer_delay,
+                p.interval,
+                now,
+            );
+            p.next_show = next;
+            if show_it {
+                if let Some(ls) = p.stat_last_show {
+                    let gap_ms = now.duration_since(ls).as_millis() as u64;
+                    p.stat_max_release_gap_ms = p.stat_max_release_gap_ms.max(gap_ms);
+                }
+                p.stat_last_show = Some(now);
+                p.stat_shown += 1;
+                p.queue.pop_front().map(|qf| qf.data)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// One PTS-paced release decision: interpolate stale
+/// timestamp-less frames, guard against clock wraps and
+/// schedule lag, then show the smallest-timestamp frame
+/// whose show time has arrived. Sets next_show for the
+/// held/wake blocks, which are shared with the rate pacer.
+fn pts_show_step(
+    p: &mut Pump,
+    k: &str,
+    names: &HashMap<String, String>,
+    now: Instant,
+) -> Option<Vec<u8>> {
+    let (mut pts0, mut wall0) = match p.pts_anchor {
+        Some(a) => a,
+        None => return None,
+    };
+    let iv = p.interval.as_secs_f64();
+    // Interpolate frames whose timestamp lines never arrived
+    // and have waited out the grace period, in sequence
+    // order, chaining from the last assigned stream time.
+    // (A missing line is a parse miss, not a lost frame —
+    // the frame itself is here; only its timestamp is.)
+    // An interpolated value is approximate (within a frame
+    // or two of true), which the min-timestamp release
+    // tolerates: order stays right, timing stays close.
+    for qf in p.queue.iter_mut() {
+        if qf.pts.is_none() && now >= qf.arrival + PTS_GRACE {
+            if let Some(last) = p.last_pts {
+                let pts = last + iv;
+                qf.pts = Some(pts);
+                p.last_pts = Some(pts);
+                p.stat_pts_interp += 1;
+            }
+        }
+    }
+    // Wrap guard: a timestamp far behind the anchor means the
+    // camera's clock wrapped (or restarted). Keep only the
+    // new epoch's frames and re-anchor on the earliest of
+    // them; the old epoch's frames are past presentation
+    // anyway, and keeping them would play the new epoch out
+    // of order. A wrap is a once-per-many-hours event.
+    let min_new = p
+        .queue
+        .iter()
+        .filter_map(|qf| qf.pts)
+        .filter(|&pts| pts < pts0 - PTS_WRAP_SECS)
+        .fold(f64::INFINITY, f64::min);
+    if min_new.is_finite() {
+        let before = p.queue.len();
+        p.queue
+            .retain(|qf| qf.pts.map(|pts| pts < pts0 - PTS_WRAP_SECS).unwrap_or(false));
+        p.stat_late_dropped += (before - p.queue.len()) as u64;
+        p.pts_anchor = Some((min_new, now + p.buffer_delay));
+        p.last_pts = p
+            .queue
+            .iter()
+            .filter_map(|qf| qf.pts)
+            .fold(None::<f64>, |acc, pts| Some(acc.map(|a: f64| a.max(pts)).unwrap_or(pts)));
+        p.stat_pts_resync += 1;
+        let name = names.get(k).map(|s| s.as_str()).unwrap_or(k);
+        crate::hap::tstat_log(&format!("camera {name}: PTS re-anchor (wrap)"));
+        pts0 = min_new;
+        wall0 = now + p.buffer_delay;
+    }
+    // Release: smallest timestamp first (presentation order).
+    let Some((idx, show_time)) = pts_next_show(&p.queue, (pts0, wall0)) else {
+        p.next_show = None;
+        return None;
+    };
+    // Lag guard: if even the earliest frame is due more than
+    // the cushion plus slack in the future, the schedule has
+    // run ahead of reality (camera clock jumped) — shift the
+    // anchor so it shows after a normal cushion. Relative
+    // spacing is preserved, so no content is skipped, only
+    // the wait.
+    if show_time > now + p.buffer_delay + PTS_LAG_SLACK {
+        let min_pts = p.queue[idx].pts.unwrap();
+        p.pts_anchor = Some((min_pts, now + p.buffer_delay));
+        p.stat_pts_resync += 1;
+        let name = names.get(k).map(|s| s.as_str()).unwrap_or(k);
+        crate::hap::tstat_log(&format!("camera {name}: PTS re-anchor (lag)"));
+        p.next_show = Some(now + p.buffer_delay);
+        return None;
+    }
+    if now >= show_time {
+        if let Some(ls) = p.stat_last_show {
+            let gap_ms = now.duration_since(ls).as_millis() as u64;
+            p.stat_max_release_gap_ms = p.stat_max_release_gap_ms.max(gap_ms);
+        }
+        p.stat_last_show = Some(now);
+        p.stat_shown += 1;
+        let shown = p.queue.remove(idx).map(|qf| qf.data);
+        // Next wake: the next smallest timestamp's show time.
+        p.next_show = p
+            .pts_anchor
+            .and_then(|a| pts_next_show(&p.queue, a).map(|(_, t)| t));
+        shown
+    } else {
+        p.next_show = Some(show_time);
+        None
+    }
 }
 
 /// One running (or backing-off) frame pump, owned by the UI thread.
@@ -3319,13 +3558,23 @@ struct Pump {
     last_error: Option<String>,
     /// Frame pacer (v2.0.7 patches): true for Native-mode tile
     /// pumps only. When paced, arrived frames queue in `queue`
-    /// and release on the rate pacer's steady metronome
-    /// (rate_pacer_decide), so bursty delivery plays out
-    /// evenly instead of reproducing its bursts and holes.
-    /// Unpaced pumps (12 fps tiles, the Watch player) keep the
-    /// old latest-only behavior exactly.
+    /// and release on the PTS pacer (camera-clock timestamps)
+    /// when timestamps arrive, else on the rate pacer's steady
+    /// metronome. Unpaced pumps (12 fps tiles, the Watch
+    /// player) keep the old latest-only behavior exactly.
     paced: bool,
-    queue: VecDeque<(Instant, Vec<u8>)>,
+    queue: VecDeque<QueuedFrame>,
+    /// PTS pacing state: timestamp lines from ffmpeg's
+    /// showinfo log keyed by frame sequence, the frame
+    /// sequence counter, the pacing mode (None = undecided,
+    /// Some(true) = PTS, Some(false) = rate fallback), and
+    /// the anchor mapping stream time to wall time.
+    pts_rx: Receiver<(u64, f64)>,
+    pts_by_seq: HashMap<u64, f64>,
+    next_frame_seq: u64,
+    pts_mode: Option<bool>,
+    pts_anchor: Option<(f64, Instant)>,
+    last_pts: Option<f64>,
     /// Next scheduled show time (rate pacer): the metronome
     /// anchor — steady slots advance from this, never from
     /// the actual release time, so pass jitter can't
@@ -3370,6 +3619,10 @@ struct Pump {
     stat_held: u64,
     stat_empty: u64,
     stat_max_due_in_ms: u64,
+    /// PTS diagnostics (2.0.7 patch): per-window counts of
+    /// interpolated timestamps and anchor re-syncs.
+    stat_pts_interp: u64,
+    stat_pts_resync: u64,
 }
 
 impl Pump {
@@ -3428,6 +3681,7 @@ fn spawn_pump(
     ctx: &egui::Context,
 ) -> Pump {
     let (tx, rx) = channel::<FrameMsg>();
+    let (pts_tx, pts_rx) = channel::<(u64, f64)>();
     let stop = Arc::new(AtomicBool::new(false));
     let child_slot: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
     {
@@ -3458,10 +3712,14 @@ fn spawn_pump(
                     return;
                 }
             };
-            // stderr tail: last lines, for the failure reason.
+            // stderr: timestamp lines feed PTS pacing, other
+            // lines feed the failure-reason tail. Showinfo
+            // lines never reach the tail — at 25 lines/s they
+            // would push any real error out of it.
             let err_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             if let Some(stderr) = child.stderr.take() {
                 let tail = err_tail.clone();
+                let pts_tx = pts_tx.clone();
                 thread::spawn(move || {
                     use std::io::{BufRead, BufReader};
                     let mut reader = BufReader::new(stderr);
@@ -3472,12 +3730,19 @@ fn spawn_pump(
                             Ok(0) | Err(_) => break,
                             Ok(_) => {
                                 let t = line.trim().to_string();
-                                if !t.is_empty() {
-                                    if let Ok(mut v) = tail.lock() {
-                                        v.push(t);
-                                        if v.len() > 12 {
-                                            v.remove(0);
-                                        }
+                                if t.is_empty() {
+                                    continue;
+                                }
+                                if t.contains("showinfo") {
+                                    if let Some((n, pts)) = parse_showinfo_pts(&t) {
+                                        let _ = pts_tx.send((n, pts));
+                                    }
+                                    continue;
+                                }
+                                if let Ok(mut v) = tail.lock() {
+                                    v.push(t);
+                                    if v.len() > 12 {
+                                        v.remove(0);
                                     }
                                 }
                             }
@@ -3552,6 +3817,12 @@ fn spawn_pump(
         // fps filter already regularizes those).
         paced: native_fps,
         queue: VecDeque::new(),
+        pts_rx,
+        pts_by_seq: HashMap::new(),
+        next_frame_seq: 0,
+        pts_mode: None,
+        pts_anchor: None,
+        last_pts: None,
         next_show: None,
         interval: MIN_RELEASE_INTERVAL,
         buffer_delay: BUFFER_DELAY,
@@ -3570,6 +3841,8 @@ fn spawn_pump(
         stat_held: 0,
         stat_empty: 0,
         stat_max_due_in_ms: 0,
+        stat_pts_interp: 0,
+        stat_pts_resync: 0,
     }
 }
 
@@ -6388,9 +6661,10 @@ impl App {
         self.pump_force.clear();
         // Drain frame channels. Unpaced pumps keep only the
         // LATEST frame; paced (Native tile) pumps hold arrivals
-        // in a buffer and release on the rate pacer's steady
-        // metronome, so bursty delivery plays out evenly
-        // instead of reproducing its bursts and holes.
+        // in a buffer and release on the PTS pacer (camera-clock
+        // timestamps, rate metronome as fallback), so bursty
+        // delivery plays out evenly instead of reproducing its
+        // bursts and holes.
         // Buffer delays per camera tile, snapshotted before the
         // drain so the loop can retune each paced pump's clock
         // without borrowing the config mid-iteration. The
@@ -6442,8 +6716,24 @@ impl App {
                     }
                     p.stat_last_arrival = Some(now);
                 }
+                // Timestamp lines from ffmpeg's showinfo log.
+                // In rate-fallback mode they are drained and
+                // discarded — otherwise the channel would grow
+                // without bound while the drain ignores it.
+                while let Ok((n, pts)) = p.pts_rx.try_recv() {
+                    if p.pts_mode != Some(false) {
+                        p.pts_by_seq.insert(n, pts);
+                    }
+                }
                 for f in arrived {
-                    if !pacer_push(&mut p.queue, (now, f), buffer_queue_cap(p.buffer_delay)) {
+                    let seq = p.next_frame_seq;
+                    p.next_frame_seq += 1;
+                    let pts = p.pts_by_seq.remove(&seq);
+                    if !pacer_push(
+                        &mut p.queue,
+                        QueuedFrame { arrival: now, seq, pts, data: f },
+                        buffer_queue_cap(p.buffer_delay),
+                    ) {
                         p.stat_cap_dropped += 1;
                     }
                     p.arrivals.push_back(now);
@@ -6456,46 +6746,82 @@ impl App {
                 if had_arrivals {
                     // The estimate only moves while frames flow;
                     // across a stall it holds, so playback
-                    // doesn't speed up when arrivals pause.
+                    // doesn't speed up when arrivals pause. It
+                    // also paces interpolation when a timestamp
+                    // line never arrives.
                     p.interval = estimate_interval(&p.arrivals);
                 }
-                // Age drop (rate pacer backstop): frames older
+                // Fill timestamps that arrived after their frame
+                // (the stderr and stdout threads run independently).
+                for qf in p.queue.iter_mut() {
+                    if qf.pts.is_none() {
+                        if let Some(pts) = p.pts_by_seq.remove(&qf.seq) {
+                            qf.pts = Some(pts);
+                            if p.last_pts.map(|l| pts > l).unwrap_or(true) {
+                                p.last_pts = Some(pts);
+                            }
+                        }
+                    }
+                }
+                // Age drop (both pacers' backstop): frames older
                 // than the buffer delay plus slack are stale —
                 // drop them so live latency stays bounded when
                 // the pacer falls behind arrivals. (Counted as
                 // late-dropped: discarded, not shown.)
                 p.stat_late_dropped +=
                     drop_too_old(&mut p.queue, now, p.buffer_delay + MAX_AGE_SLACK) as u64;
-                match p.queue.front().map(|(t, _)| *t) {
-                    None => {
-                        // Queue empty: drop the schedule so the
-                        // next frames re-arm with a fresh cushion
-                        // instead of chasing a stale metronome.
-                        p.next_show = None;
-                        None
-                    }
-                    Some(front_arrival) => {
-                        let (show_it, next) = rate_pacer_decide(
-                            p.next_show,
-                            front_arrival,
-                            p.buffer_delay,
-                            p.interval,
-                            now,
-                        );
-                        p.next_show = next;
-                        if show_it {
-                            if let Some(ls) = p.stat_last_show {
-                                let gap_ms = now.duration_since(ls).as_millis() as u64;
-                                p.stat_max_release_gap_ms =
-                                    p.stat_max_release_gap_ms.max(gap_ms);
+                // Pacing mode, decided once per pump: the first
+                // real timestamp switches to PTS pacing; 25
+                // frames without one falls back to the rate
+                // pacer (showinfo missing or unparsable — the
+                // rate pacer is exactly the previous behavior).
+                if p.pts_mode.is_none() {
+                    if let Some((ai, apts)) = p
+                        .queue
+                        .iter()
+                        .enumerate()
+                        .find_map(|(i, qf)| qf.pts.map(|pts| (i, pts)))
+                    {
+                        // Anchor on the first timestamped frame:
+                        // it shows one buffer delay after it
+                        // arrived (the cushion), and every other
+                        // frame shows at its own stream time
+                        // under that anchor. Earlier frames
+                        // without timestamps interpolate
+                        // backward from the anchor so order is
+                        // preserved; nothing has shown yet, so
+                        // no visible jump.
+                        let aseq = p.queue[ai].seq;
+                        let wall0 = p.queue[ai].arrival + p.buffer_delay;
+                        let iv = p.interval.as_secs_f64();
+                        for qf in p.queue.iter_mut() {
+                            if qf.pts.is_none() && qf.seq < aseq {
+                                qf.pts = Some(apts - (aseq - qf.seq) as f64 * iv);
                             }
-                            p.stat_last_show = Some(now);
-                            p.stat_shown += 1;
-                            p.queue.pop_front().map(|(_, f)| f)
-                        } else {
-                            None
                         }
+                        p.pts_anchor = Some((apts, wall0));
+                        p.last_pts = Some(p.last_pts.map(|l| l.max(apts)).unwrap_or(apts));
+                        p.pts_mode = Some(true);
+                        let name = names.get(k).map(|s| s.as_str()).unwrap_or(k.as_str());
+                        crate::hap::tstat_log(&format!("camera {name}: PTS pacing"));
+                    } else if p.queue.len() >= PTS_FALLBACK_FRAMES {
+                        p.pts_mode = Some(false);
+                        let name = names.get(k).map(|s| s.as_str()).unwrap_or(k.as_str());
+                        crate::hap::tstat_log(&format!(
+                            "camera {name}: PTS unavailable, rate pacing"
+                        ));
                     }
+                }
+                if p.pts_mode == Some(true) {
+                    pts_show_step(p, k.as_str(), &names, now)
+                } else if p.pts_mode == Some(false) {
+                    rate_show_step(p, now)
+                } else {
+                    // Undecided: hold everything until the first
+                    // timestamp arrives or the fallback trips.
+                    // next_show stays None, so the held/wake
+                    // blocks below read arming.
+                    None
                 }
             } else {
                 arrived.into_iter().last()
@@ -6521,8 +6847,8 @@ impl App {
                             None => {
                                 // Arming: the front ages toward a
                                 // full buffer delay.
-                                if let Some((t, _)) = p.queue.front() {
-                                    (*t + p.buffer_delay)
+                                if let Some(qf) = p.queue.front() {
+                                    (qf.arrival + p.buffer_delay)
                                         .saturating_duration_since(now)
                                         .as_millis() as u64
                                 } else {
@@ -6565,14 +6891,16 @@ impl App {
                 next_retry = Some(next_retry.map(|x: Instant| x.min(t)).unwrap_or(t));
             }
             if p.paced {
-                // Rate pacer wake: the next scheduled show, or
+                // Pacer wake: the next scheduled show, or
                 // — while arming — the moment the front ages a
                 // full buffer delay. No wake when the queue is
                 // empty; the 50 ms loop re-arms passes until
-                // frames return.
+                // frames return. Shared by both pacers: each
+                // show step leaves next_show at the next show
+                // time (or None).
                 let wake = match p.next_show {
                     Some(ns) => Some(ns),
-                    None => p.queue.front().map(|(t, _)| *t + p.buffer_delay),
+                    None => p.queue.front().map(|qf| qf.arrival + p.buffer_delay),
                 };
                 if let Some(w) = wake {
                     next_wake = Some(next_wake.map(|x: Instant| x.min(w)).unwrap_or(w));
@@ -6584,7 +6912,7 @@ impl App {
             if p.paced && Instant::now() >= p.stat_window_start + Duration::from_secs(10) {
                 let name = names.get(k).map(|s| s.as_str()).unwrap_or(k.as_str());
                 crate::hap::tstat_log(&format!(
-                    "camera {name}: 10 s — {} arrived, {} shown, {} cap-dropped, {} late-dropped, max release gap {} ms, max arrival gap {} ms, max queue {}, passes {}, held {}, empty {}, max due-in {} ms, interval {} ms, delay {} ms",
+                    "camera {name}: 10 s — {} arrived, {} shown, {} cap-dropped, {} late-dropped, max release gap {} ms, max arrival gap {} ms, max queue {}, passes {}, held {}, empty {}, max due-in {} ms, interval {} ms, delay {} ms, pts {}, interp {}, resync {}",
                     p.stat_received,
                     p.stat_shown,
                     p.stat_cap_dropped,
@@ -6598,6 +6926,13 @@ impl App {
                     p.stat_max_due_in_ms,
                     p.interval.as_millis(),
                     p.buffer_delay.as_millis(),
+                    match p.pts_mode {
+                        Some(true) => "pts",
+                        Some(false) => "rate",
+                        None => "?",
+                    },
+                    p.stat_pts_interp,
+                    p.stat_pts_resync,
                 ));
                 p.stat_window_start = Instant::now();
                 p.stat_received = 0;
@@ -6611,6 +6946,8 @@ impl App {
                 p.stat_held = 0;
                 p.stat_empty = 0;
                 p.stat_max_due_in_ms = 0;
+                p.stat_pts_interp = 0;
+                p.stat_pts_resync = 0;
             }
         }
         if any_active {
@@ -12763,15 +13100,21 @@ mod tests {
     fn ffmpeg_args_native_drops_the_fps_cap() {
         // v2.0.7: the tile's Native mode runs at the stream's own
         // frame rate — the fps filter is gone, scale/pad stay.
+        // PTS pacing adds showinfo to that same filter chain,
+        // plus passthrough so timestamp lines pair 1:1 with
+        // output frames.
         let url = "rtsp://u:p@192.168.1.50:554/stream2";
         let args = ffmpeg_args(url, TILE_W, TILE_H, true);
         assert!(!args.iter().any(|a| a.contains("fps=")));
-        assert!(args.iter().any(|a| a
-            == "scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2"));
+        assert!(args.iter().any(|a| a.starts_with("scale=480:270")
+            && a.contains("pad=480:270")
+            && a.contains("showinfo")));
+        assert!(args.iter().any(|a| a == "-vsync"));
         // And the low mode still caps, so the toggle has two
-        // genuinely different feeds.
+        // genuinely different feeds, with no timestamp logging.
         let low = ffmpeg_args(url, TILE_W, TILE_H, false);
         assert!(low.iter().any(|a| a.contains("fps=12")));
+        assert!(!low.iter().any(|a| a.contains("showinfo")));
     }
 
     #[test]
@@ -12799,16 +13142,17 @@ mod tests {
         // since 60 frames ≈ 2.7 s and no frame lived long
         // enough to become due.)
         let now = Instant::now();
-        let mut q: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
+        let mut q: VecDeque<QueuedFrame> = VecDeque::new();
         let mut refused = 0;
         for i in 0..(PACER_MAX_QUEUE + 2) {
-            if !pacer_push(&mut q, (now, vec![i as u8]), PACER_MAX_QUEUE) {
+            let qf = QueuedFrame { arrival: now, seq: i as u64, pts: None, data: vec![i as u8] };
+            if !pacer_push(&mut q, qf, PACER_MAX_QUEUE) {
                 refused += 1;
             }
         }
         assert_eq!(refused, 2);
         assert_eq!(q.len(), PACER_MAX_QUEUE);
-        let kept: Vec<u8> = q.iter().map(|(_, f)| f[0]).collect();
+        let kept: Vec<u8> = q.iter().map(|qf| qf.data[0]).collect();
         assert_eq!(kept[0], 0);
         assert_eq!(*kept.last().unwrap(), (PACER_MAX_QUEUE - 1) as u8);
     }
@@ -12831,19 +13175,19 @@ mod tests {
         // beats a blank tile.
         let base = Instant::now();
         let max_age = Duration::from_millis(2000);
-        let mut q: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
-        q.push_back((base, vec![0]));
-        q.push_back((base + Duration::from_millis(1500), vec![1]));
-        q.push_back((base + Duration::from_millis(1900), vec![2]));
+        let mut q: VecDeque<QueuedFrame> = VecDeque::new();
+        q.push_back(QueuedFrame { arrival: base, seq: 0, pts: None, data: vec![0] });
+        q.push_back(QueuedFrame { arrival: base + Duration::from_millis(1500), seq: 1, pts: None, data: vec![1] });
+        q.push_back(QueuedFrame { arrival: base + Duration::from_millis(1900), seq: 2, pts: None, data: vec![2] });
         // At base + 2001 only the first frame is over age
         // (the check is strictly older, so exactly-at-age kept).
         assert_eq!(drop_too_old(&mut q, base + Duration::from_millis(2001), max_age), 1);
         assert_eq!(q.len(), 2);
-        assert_eq!(q.front().unwrap().1[0], 1);
+        assert_eq!(q.front().unwrap().data[0], 1);
         // Far later everything is over age except the newest.
         assert_eq!(drop_too_old(&mut q, base + Duration::from_millis(9000), max_age), 1);
         assert_eq!(q.len(), 1);
-        assert_eq!(q.front().unwrap().1[0], 2);
+        assert_eq!(q.front().unwrap().data[0], 2);
     }
 
     #[test]
@@ -12919,6 +13263,71 @@ mod tests {
         assert_eq!(estimate_interval(&slow), MAX_RELEASE_INTERVAL);
         // Too few arrivals to measure → the floor.
         assert_eq!(estimate_interval(&VecDeque::new()), MIN_RELEASE_INTERVAL);
+    }
+
+    #[test]
+    fn parse_showinfo_pts_reads_frames_and_ignores_noise() {
+        // PTS pacing: timestamp lines pair frames to the
+        // camera's clock. Format varies by ffmpeg build
+        // (filter instance name, address, spacing) — the
+        // token parse must not care.
+        let line = "[Parsed_showinfo_0_2 @ 0x7f8a1c00] n:   0 pts:  123456 pts_time: 1.234567 fmt: yuv420p sar: 1/1 s: 960x540";
+        assert_eq!(parse_showinfo_pts(line), Some((0, 1.234567)));
+        let line2 = "[Parsed_showinfo_1 @ 0x123] n:  42 pts:  90000 pts_time: 10.5 sar: 0/1";
+        assert_eq!(parse_showinfo_pts(line2), Some((42, 10.5)));
+        // Missing either field → None (the frame interpolates).
+        assert_eq!(parse_showinfo_pts("n: 7 pts: 100"), None);
+        assert_eq!(parse_showinfo_pts("pts_time: 3.25"), None);
+        // Non-showinfo stderr (stream info, errors) → None.
+        assert_eq!(parse_showinfo_pts("Stream #0:0: Video: h264"), None);
+        assert_eq!(parse_showinfo_pts(""), None);
+    }
+
+    #[test]
+    fn pts_show_time_maps_stream_time_to_wall_time() {
+        // PTS pacing: show_time(pts) = wall0 + (pts - pts0),
+        // including negative offsets (a B-frame's presentation
+        // time can precede the anchor frame's).
+        let base = Instant::now();
+        assert_eq!(pts_show_time(10.0, base, 10.0), base);
+        assert_eq!(
+            pts_show_time(10.0, base, 11.5),
+            base + Duration::from_millis(1500)
+        );
+        assert_eq!(
+            pts_show_time(10.0, base, 9.96),
+            base - Duration::from_millis(40)
+        );
+    }
+
+    #[test]
+    fn pts_next_show_picks_presentation_order() {
+        // PTS pacing: the smallest timestamp wins, not the
+        // front of the queue — this is what reorders B-frames
+        // (decode order F1, F3, F2 → presentation F1, F2, F3).
+        // Frames still awaiting timestamps are skipped.
+        let base = Instant::now();
+        let mut q: VecDeque<QueuedFrame> = VecDeque::new();
+        q.push_back(QueuedFrame { arrival: base, seq: 0, pts: Some(10.0), data: vec![0] });
+        q.push_back(QueuedFrame { arrival: base, seq: 1, pts: Some(10.08), data: vec![1] });
+        q.push_back(QueuedFrame { arrival: base, seq: 2, pts: Some(10.04), data: vec![2] });
+        q.push_back(QueuedFrame { arrival: base, seq: 3, pts: None, data: vec![3] });
+        // Decode order F1, F3, F2 with presentation times
+        // 10.0, 10.08, 10.04: first the front wins (10.0),
+        // then — after it leaves — the reorder shows: the
+        // front holds 10.08 but the minimum is the frame
+        // behind it at 10.04.
+        let (idx, t) = pts_next_show(&q, (10.0, base)).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(t, base);
+        q.remove(idx);
+        let (idx, t) = pts_next_show(&q, (10.0, base)).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(t, base + Duration::from_millis(40));
+        // All timestamps missing → None (nothing guessable).
+        let mut q2: VecDeque<QueuedFrame> = VecDeque::new();
+        q2.push_back(QueuedFrame { arrival: base, seq: 0, pts: None, data: vec![0] });
+        assert_eq!(pts_next_show(&q2, (10.0, base)), None);
     }
 
     #[test]
@@ -13014,6 +13423,7 @@ mod tests {
         assert_eq!(pump_backoff(9), Duration::from_secs(8));
 
         let (_tx, rx) = channel::<FrameMsg>();
+        let (_pts_tx, pts_rx) = channel::<(u64, f64)>();
         let mut p = Pump {
             state: PumpState::Connecting,
             source_key: "k".into(),
@@ -13028,6 +13438,12 @@ mod tests {
             last_error: None,
             paced: false,
             queue: VecDeque::new(),
+            pts_rx,
+            pts_by_seq: HashMap::new(),
+            next_frame_seq: 0,
+            pts_mode: None,
+            pts_anchor: None,
+            last_pts: None,
             next_show: None,
             interval: MIN_RELEASE_INTERVAL,
             buffer_delay: BUFFER_DELAY,
@@ -13046,6 +13462,8 @@ mod tests {
             stat_held: 0,
             stat_empty: 0,
             stat_max_due_in_ms: 0,
+            stat_pts_interp: 0,
+            stat_pts_resync: 0,
         };
         // Connecting --frame--> Live, streak reset.
         p.note_frame();
