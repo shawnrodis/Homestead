@@ -3162,6 +3162,12 @@ const MAX_RELEASE_INTERVAL: Duration = Duration::from_millis(200);
 const PACER_MAX_QUEUE: usize = 60;
 /// Window the source-rate estimate looks back over.
 const RATE_WINDOW: Duration = Duration::from_secs(5);
+/// Slack past the buffer delay before a queued frame counts
+/// as too old to show (rate pacer): a frame may wait out its
+/// buffer delay plus this long — live latency stays bounded
+/// near delay + slack instead of growing without limit when
+/// the pacer falls behind arrivals.
+const MAX_AGE_SLACK: Duration = Duration::from_millis(1000);
 
 /// Push a frame onto a buffer queue, refusing the new frame
 /// while the queue is at its bound — latency stays capped even
@@ -3208,25 +3214,52 @@ fn estimate_interval(arrivals: &VecDeque<Instant>) -> Duration {
     (span / (arrivals.len() as u32 - 1)).clamp(MIN_RELEASE_INTERVAL, MAX_RELEASE_INTERVAL)
 }
 
-/// When a paced pump's front frame may next show: not before
-/// its buffer delay elapses, and not sooner than one source
-/// interval after the previous frame's SCHEDULED show time.
-/// The later of the two wins — the delay covers stalls, the
-/// interval keeps the playback rate at the stream's own.
-/// Timing patch: the schedule advances from scheduled times,
-/// never from actual (possibly late) release times, so pass
-/// jitter can't accumulate into the display cadence — the
-/// metronome VLC's clock gives it, minus the timestamps.
-fn next_release_time(
+/// Rate pacer decision (replaces the delay line): releases
+/// run on a steady metronome decoupled from arrival bursts,
+/// so a bursty delivery (frames in clumps, ~400 ms pauses)
+/// plays out evenly instead of reproducing its bursts and
+/// holes a second later. The buffer delay survives only as
+/// the arming cushion: the first show after start (or after
+/// the queue empties) waits until the front has aged a full
+/// delay, so a cushion exists before steady playback.
+/// Returns (show, new next_show).
+fn rate_pacer_decide(
+    next_show: Option<Instant>,
     front_arrival: Instant,
-    prev_sched: Option<Instant>,
-    interval: Duration,
     buffer_delay: Duration,
-) -> Instant {
-    let due = front_arrival + buffer_delay;
-    match prev_sched {
-        Some(ps) => due.max(ps + interval),
-        None => due,
+    interval: Duration,
+    now: Instant,
+) -> (bool, Option<Instant>) {
+    match next_show {
+        None => {
+            // Arming: wait for a full buffer delay of cushion.
+            // (Buffer 0 arms immediately — the user's choice
+            // to see the raw stream, no cushion.)
+            if now >= front_arrival + buffer_delay {
+                (true, Some(now + interval))
+            } else {
+                (false, None)
+            }
+        }
+        Some(ns) => {
+            if now >= ns {
+                // Steady: advance from the SCHEDULED slot, not
+                // from now, so pass jitter can't accumulate.
+                // If the schedule fell far behind (a long
+                // stall), resync instead of fast-forwarding a
+                // burst of stale frames — the age-drop below
+                // trims the backlog separately.
+                let advanced = ns + interval;
+                let next = if advanced + interval < now {
+                    now + interval
+                } else {
+                    advanced
+                };
+                (true, Some(next))
+            } else {
+                (false, Some(ns))
+            }
+        }
     }
 }
 
@@ -3241,25 +3274,24 @@ fn buffer_queue_cap(buffer_delay: Duration) -> usize {
     frames.max(PACER_MAX_QUEUE)
 }
 
-/// VLC-style late drop (timing patch): while a newer queued
-/// frame is already due, the front is stale — drop it instead
-/// of playing catch-up one old frame at a time. In steady
-/// state the second frame is never due yet, so this drops
-/// nothing; after a hitch it jumps straight to the frame that
-/// should be showing now, and the stream stays on time.
+/// Age drop (rate pacer backstop): while the front frame is
+/// older than the buffer delay plus slack, drop it — live
+/// latency stays bounded when the pacer falls behind
+/// arrivals. Always keeps at least one frame: an over-age
+/// single frame still shows (stale video beats a blank tile).
 /// Returns how many frames were dropped.
-fn drop_stale_fronts(
+fn drop_too_old(
     queue: &mut VecDeque<(Instant, Vec<u8>)>,
     now: Instant,
-    delay: Duration,
+    max_age: Duration,
 ) -> usize {
     let mut dropped = 0;
     while queue.len() > 1 {
-        let second_due = queue
-            .get(1)
-            .map(|(t, _)| *t + delay <= now)
+        let too_old = queue
+            .front()
+            .map(|(t, _)| *t + max_age < now)
             .unwrap_or(false);
-        if second_due {
+        if too_old {
             queue.pop_front();
             dropped += 1;
         } else {
@@ -3287,21 +3319,23 @@ struct Pump {
     last_error: Option<String>,
     /// Frame pacer (v2.0.7 patches): true for Native-mode tile
     /// pumps only. When paced, arrived frames queue in `queue`
-    /// with their arrival times and release on the VLC-style
-    /// buffer clock (next_release_time), so delivery stalls up
-    /// to ~1 s play through instead of freezing the tile.
+    /// and release on the rate pacer's steady metronome
+    /// (rate_pacer_decide), so bursty delivery plays out
+    /// evenly instead of reproducing its bursts and holes.
     /// Unpaced pumps (12 fps tiles, the Watch player) keep the
     /// old latest-only behavior exactly.
     paced: bool,
     queue: VecDeque<(Instant, Vec<u8>)>,
-    /// Scheduled show time of the last shown frame (timing
-    /// patch: the metronome anchor — the next slot advances
-    /// from this, never from the actual release time, so pass
-    /// jitter can't accumulate into the display cadence), and
-    /// the stream's measured frame interval (estimate_interval,
-    /// held across stalls so playback doesn't speed up when
-    /// arrivals pause).
-    prev_sched: Option<Instant>,
+    /// Next scheduled show time (rate pacer): the metronome
+    /// anchor — steady slots advance from this, never from
+    /// the actual release time, so pass jitter can't
+    /// accumulate; None while arming (waiting for a full
+    /// buffer delay of cushion) or while the queue is empty.
+    /// Also feeds the wake that drives the next pass.
+    next_show: Option<Instant>,
+    /// The stream's measured frame interval
+    /// (estimate_interval, held across stalls so playback
+    /// doesn't speed up when arrivals pause).
     interval: Duration,
     /// The tile's Buffer slider value, refreshed from the
     /// camera record every drain pass — so moving the slider
@@ -3518,7 +3552,7 @@ fn spawn_pump(
         // fps filter already regularizes those).
         paced: native_fps,
         queue: VecDeque::new(),
-        prev_sched: None,
+        next_show: None,
         interval: MIN_RELEASE_INTERVAL,
         buffer_delay: BUFFER_DELAY,
         arrivals: VecDeque::new(),
@@ -6354,9 +6388,9 @@ impl App {
         self.pump_force.clear();
         // Drain frame channels. Unpaced pumps keep only the
         // LATEST frame; paced (Native tile) pumps hold arrivals
-        // in a VLC-style ~1 s buffer and release on the buffer
-        // clock, so delivery stalls play through instead of
-        // freezing the tile.
+        // in a buffer and release on the rate pacer's steady
+        // metronome, so bursty delivery plays out evenly
+        // instead of reproducing its bursts and holes.
         // Buffer delays per camera tile, snapshotted before the
         // drain so the loop can retune each paced pump's clock
         // without borrowing the config mid-iteration. The
@@ -6425,26 +6459,31 @@ impl App {
                     // doesn't speed up when arrivals pause.
                     p.interval = estimate_interval(&p.arrivals);
                 }
-                // VLC-style late drop (timing patch): if a newer
-                // frame is already due, the front is stale — drop
-                // it instead of playing catch-up one old frame
-                // at a time. In steady state the second frame is
-                // never due yet, so this drops nothing.
+                // Age drop (rate pacer backstop): frames older
+                // than the buffer delay plus slack are stale —
+                // drop them so live latency stays bounded when
+                // the pacer falls behind arrivals. (Counted as
+                // late-dropped: discarded, not shown.)
                 p.stat_late_dropped +=
-                    drop_stale_fronts(&mut p.queue, now, p.buffer_delay) as u64;
-                let front_arrival = p.queue.front().map(|(t, _)| *t);
-                match front_arrival {
-                    Some(t) => {
-                        let due =
-                            next_release_time(t, p.prev_sched, p.interval, p.buffer_delay);
-                        if now >= due {
-                            // Metronome (timing patch): the next
-                            // slot advances from the SCHEDULED
-                            // show time, not from the actual
-                            // (possibly late) release — pass
-                            // jitter can't accumulate into the
-                            // display cadence.
-                            p.prev_sched = Some(due);
+                    drop_too_old(&mut p.queue, now, p.buffer_delay + MAX_AGE_SLACK) as u64;
+                match p.queue.front().map(|(t, _)| *t) {
+                    None => {
+                        // Queue empty: drop the schedule so the
+                        // next frames re-arm with a fresh cushion
+                        // instead of chasing a stale metronome.
+                        p.next_show = None;
+                        None
+                    }
+                    Some(front_arrival) => {
+                        let (show_it, next) = rate_pacer_decide(
+                            p.next_show,
+                            front_arrival,
+                            p.buffer_delay,
+                            p.interval,
+                            now,
+                        );
+                        p.next_show = next;
+                        if show_it {
                             if let Some(ls) = p.stat_last_show {
                                 let gap_ms = now.duration_since(ls).as_millis() as u64;
                                 p.stat_max_release_gap_ms =
@@ -6457,18 +6496,17 @@ impl App {
                             None
                         }
                     }
-                    None => None,
                 }
             } else {
                 arrived.into_iter().last()
             };
             // Decision-level diagnostics: every paced pass
-            // either shows, holds (queue non-empty but front
-            // not due), or finds the queue empty. The due-in
-            // on held passes says how far the front is from
-            // due — the missing piece in the last log round,
-            // where shows stalled 400 ms while passes ran at
-            // 50 ms with a deep queue.
+            // either shows, holds (queue non-empty but the
+            // metronome slot hasn't arrived, or the front is
+            // still arming toward a full buffer delay), or
+            // finds the queue empty. The due-in on held passes
+            // says how far the next show is — the number that
+            // exposed the delay line's burst reproduction.
             if p.paced {
                 p.stat_passes += 1;
                 if show.is_none() {
@@ -6476,17 +6514,23 @@ impl App {
                         p.stat_empty += 1;
                     } else {
                         p.stat_held += 1;
-                        if let Some((t, _)) = p.queue.front() {
-                            let due = next_release_time(
-                                *t,
-                                p.prev_sched,
-                                p.interval,
-                                p.buffer_delay,
-                            );
-                            let due_in =
-                                due.saturating_duration_since(now).as_millis() as u64;
-                            p.stat_max_due_in_ms = p.stat_max_due_in_ms.max(due_in);
-                        }
+                        let due_in = match p.next_show {
+                            Some(ns) => {
+                                ns.saturating_duration_since(now).as_millis() as u64
+                            }
+                            None => {
+                                // Arming: the front ages toward a
+                                // full buffer delay.
+                                if let Some((t, _)) = p.queue.front() {
+                                    (*t + p.buffer_delay)
+                                        .saturating_duration_since(now)
+                                        .as_millis() as u64
+                                } else {
+                                    0
+                                }
+                            }
+                        };
+                        p.stat_max_due_in_ms = p.stat_max_due_in_ms.max(due_in);
                     }
                 }
             }
@@ -6521,9 +6565,17 @@ impl App {
                 next_retry = Some(next_retry.map(|x: Instant| x.min(t)).unwrap_or(t));
             }
             if p.paced {
-                if let Some((t, _)) = p.queue.front() {
-                    let wake = next_release_time(*t, p.prev_sched, p.interval, p.buffer_delay);
-                    next_wake = Some(next_wake.map(|x: Instant| x.min(wake)).unwrap_or(wake));
+                // Rate pacer wake: the next scheduled show, or
+                // — while arming — the moment the front ages a
+                // full buffer delay. No wake when the queue is
+                // empty; the 50 ms loop re-arms passes until
+                // frames return.
+                let wake = match p.next_show {
+                    Some(ns) => Some(ns),
+                    None => p.queue.front().map(|(t, _)| *t + p.buffer_delay),
+                };
+                if let Some(w) = wake {
+                    next_wake = Some(next_wake.map(|x: Instant| x.min(w)).unwrap_or(w));
                 }
             }
             // Instrumented patch: one summary line per paced
@@ -12773,26 +12825,71 @@ mod tests {
     }
 
     #[test]
-    fn drop_stale_fronts_keeps_steady_state_intact() {
-        // Timing patch: in steady state the second frame is
-        // never due yet, so the late drop drops nothing.
+    fn drop_too_old_trims_stale_prefix_keeping_newest() {
+        // Rate pacer backstop: frames older than delay + slack
+        // go, but the newest always survives — stale video
+        // beats a blank tile.
         let base = Instant::now();
-        let delay = Duration::from_millis(1000);
+        let max_age = Duration::from_millis(2000);
         let mut q: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
         q.push_back((base, vec![0]));
-        q.push_back((base + Duration::from_millis(45), vec![1]));
-        q.push_back((base + Duration::from_millis(90), vec![2]));
-        // Front due now, second due one interval from now.
-        assert_eq!(drop_stale_fronts(&mut q, base + delay, delay), 0);
-        assert_eq!(q.len(), 3);
-        // Two intervals later both the front and the second
-        // are due: the drop jumps to the newest due frame.
-        assert_eq!(
-            drop_stale_fronts(&mut q, base + delay + Duration::from_millis(90), delay),
-            2
-        );
+        q.push_back((base + Duration::from_millis(1500), vec![1]));
+        q.push_back((base + Duration::from_millis(1900), vec![2]));
+        // At base + 2001 only the first frame is over age
+        // (the check is strictly older, so exactly-at-age kept).
+        assert_eq!(drop_too_old(&mut q, base + Duration::from_millis(2001), max_age), 1);
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.front().unwrap().1[0], 1);
+        // Far later everything is over age except the newest.
+        assert_eq!(drop_too_old(&mut q, base + Duration::from_millis(9000), max_age), 1);
         assert_eq!(q.len(), 1);
         assert_eq!(q.front().unwrap().1[0], 2);
+    }
+
+    #[test]
+    fn rate_pacer_decide_arms_steady_and_resyncs() {
+        // Rate pacer: arming waits for a full buffer delay of
+        // cushion; steady slots advance from the schedule;
+        // a schedule far behind resyncs instead of bursting.
+        let base = Instant::now();
+        let delay = Duration::from_millis(1000);
+        let iv = Duration::from_millis(40);
+        // Arming: front too young → hold, schedule stays None.
+        assert_eq!(
+            rate_pacer_decide(None, base, delay, iv, base + Duration::from_millis(600)),
+            (false, None)
+        );
+        // Arming: front aged a full delay → show, next slot
+        // one interval out.
+        let (show, next) =
+            rate_pacer_decide(None, base, delay, iv, base + Duration::from_millis(1000));
+        assert!(show);
+        assert_eq!(next, Some(base + Duration::from_millis(1040)));
+        // Steady: slot not yet reached → hold, schedule kept.
+        assert_eq!(
+            rate_pacer_decide(next, base, delay, iv, base + Duration::from_millis(1020)),
+            (false, next)
+        );
+        // Steady: slot reached → show, slot advances from the
+        // schedule, not from now.
+        let (show, next2) =
+            rate_pacer_decide(next, base, delay, iv, base + Duration::from_millis(1040));
+        assert!(show);
+        assert_eq!(next2, Some(base + Duration::from_millis(1080)));
+        // Far behind (a long stall) → show once, then resync
+        // to now + interval instead of fast-forwarding.
+        let (show, next3) = rate_pacer_decide(
+            Some(base),
+            base,
+            delay,
+            iv,
+            base + Duration::from_millis(5000),
+        );
+        assert!(show);
+        assert_eq!(next3, Some(base + Duration::from_millis(5040)));
+        // Buffer 0 arms immediately — no cushion by choice.
+        let (show, _) = rate_pacer_decide(None, base, Duration::ZERO, iv, base);
+        assert!(show);
     }
 
     #[test]
@@ -12822,33 +12919,6 @@ mod tests {
         assert_eq!(estimate_interval(&slow), MAX_RELEASE_INTERVAL);
         // Too few arrivals to measure → the floor.
         assert_eq!(estimate_interval(&VecDeque::new()), MIN_RELEASE_INTERVAL);
-    }
-
-    #[test]
-    fn next_release_time_takes_the_later_rule() {
-        // v2.0.7 patch 2: a frame can't show before its buffer
-        // delay elapses, nor sooner than one source interval
-        // after the previous release. Patch 3 makes the delay
-        // the tile's slider value instead of a constant.
-        let base = Instant::now();
-        let delay = Duration::from_millis(1500);
-        // No previous release: the delay alone decides.
-        assert_eq!(
-            next_release_time(base, None, Duration::from_millis(67), delay),
-            base + delay
-        );
-        // A recent release pushes the next showing later than
-        // the delay would on its own.
-        let last = base + Duration::from_millis(1490);
-        assert_eq!(
-            next_release_time(base, Some(last), Duration::from_millis(67), delay),
-            last + Duration::from_millis(67)
-        );
-        // Zero delay: the interval rule alone decides.
-        assert_eq!(
-            next_release_time(base, None, Duration::from_millis(67), Duration::ZERO),
-            base
-        );
     }
 
     #[test]
@@ -12958,7 +13028,7 @@ mod tests {
             last_error: None,
             paced: false,
             queue: VecDeque::new(),
-            prev_sched: None,
+            next_show: None,
             interval: MIN_RELEASE_INTERVAL,
             buffer_delay: BUFFER_DELAY,
             arrivals: VecDeque::new(),
