@@ -3128,30 +3128,83 @@ fn pump_source_key(ffmpeg: &Path, url: &str, w: usize, h: usize, native_fps: boo
     )
 }
 
-/// Pacer release interval (v2.0.7 patch): one frame per 33 ms
-/// (~30 fps ceiling) — covers Tapo Stream 1/2 native rates.
-/// A burst arriving together plays out at this cadence instead
-/// of landing in a single repaint.
-const PACER_INTERVAL: Duration = Duration::from_millis(33);
-/// Max queued frames per paced pump: ~200 ms of held video.
-/// Beyond that the oldest frames drop, so a fast source can't
-/// grow the queue (and the latency) without bound.
-const PACER_MAX_QUEUE: usize = 6;
+/// VLC-style buffer for Native tile pumps (v2.0.7 patch 2): a
+/// frame becomes displayable BUFFER_DELAY after it arrives, so
+/// the tile always plays from ~1 s of held video — the same
+/// cushion VLC's network cache gives it. Delivery stalls up to
+/// ~1 s play through from the buffer instead of freezing the
+/// tile; longer stalls re-buffer for ~1 s once the stream
+/// resumes, exactly like VLC.
+const BUFFER_DELAY: Duration = Duration::from_millis(1000);
+/// Fastest the buffer releases: one frame per 33 ms (~30 fps
+/// ceiling). The normal release spacing is the stream's own
+/// measured interval (estimate_interval), so a 15 fps camera
+/// plays at 15 fps — the buffer neither drains nor floods.
+const MIN_RELEASE_INTERVAL: Duration = Duration::from_millis(33);
+/// Slowest the buffer releases: a source slower than 5 fps is
+/// treated as 5 fps, so catch-up after a burst never crawls.
+const MAX_RELEASE_INTERVAL: Duration = Duration::from_millis(200);
+/// Max queued frames per paced pump (safety cap, ~2 s at
+/// 30 fps): a normal 1 s buffer holds 15–30 frames; beyond the
+/// cap the oldest frames drop.
+const PACER_MAX_QUEUE: usize = 60;
+/// Window the source-rate estimate looks back over.
+const RATE_WINDOW: Duration = Duration::from_secs(5);
 
-/// Push a frame onto a pacer queue, dropping the oldest while
+/// Push a frame onto a buffer queue, dropping the oldest while
 /// the queue exceeds its bound — latency stays capped even if
-/// the source bursts faster than the pacer releases.
-fn pacer_push(queue: &mut VecDeque<Vec<u8>>, frame: Vec<u8>, max: usize) {
+/// the source floods faster than the buffer releases.
+fn pacer_push(queue: &mut VecDeque<(Instant, Vec<u8>)>, frame: (Instant, Vec<u8>), max: usize) {
     queue.push_back(frame);
     while queue.len() > max {
         queue.pop_front();
     }
 }
 
-/// True when a paced pump may release a frame now: idle (no
-/// pending tick) or the pending tick has arrived.
-fn pacer_due(next_release: Option<Instant>, now: Instant) -> bool {
-    next_release.map(|t| now >= t).unwrap_or(true)
+/// Drop arrival timestamps older than the rate window, so the
+/// source-rate estimate tracks the live stream, not history.
+fn prune_arrivals(arrivals: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+    while let Some(front) = arrivals.front() {
+        if now.duration_since(*front) > window {
+            arrivals.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// The stream's own frame interval, from the arrival times in
+/// the rate window: the average gap between arrivals, clamped
+/// to the release bounds. A burst-delivering camera measures
+/// at its long-run rate (frames per second over the window),
+/// so its bursts play out at that rate instead of at the
+/// 33 ms floor. Too few arrivals to measure → the floor.
+fn estimate_interval(arrivals: &VecDeque<Instant>) -> Duration {
+    if arrivals.len() < 2 {
+        return MIN_RELEASE_INTERVAL;
+    }
+    let span = *arrivals.back().unwrap() - *arrivals.front().unwrap();
+    if span < Duration::from_millis(500) {
+        return MIN_RELEASE_INTERVAL;
+    }
+    (span / (arrivals.len() as u32 - 1)).clamp(MIN_RELEASE_INTERVAL, MAX_RELEASE_INTERVAL)
+}
+
+/// When a paced pump's front frame may next show: not before
+/// its buffer delay elapses, and not sooner than one source
+/// interval after the previous release. The later of the two
+/// wins — the delay covers stalls, the interval keeps the
+/// playback rate at the stream's own.
+fn next_release_time(
+    front_arrival: Instant,
+    last_release: Option<Instant>,
+    interval: Duration,
+) -> Instant {
+    let due = front_arrival + BUFFER_DELAY;
+    match last_release {
+        Some(lr) => due.max(lr + interval),
+        None => due,
+    }
 }
 
 /// One running (or backing-off) frame pump, owned by the UI thread.
@@ -3170,18 +3223,23 @@ struct Pump {
     /// Last mapped failure reason (v1.2.2) — shown under the
     /// tile's retry status after repeated failures.
     last_error: Option<String>,
-    /// Frame pacer (v2.0.7 patch): true for Native-mode tile
+    /// Frame pacer (v2.0.7 patches): true for Native-mode tile
     /// pumps only. When paced, arrived frames queue in `queue`
-    /// and the drain releases at most one per PACER_INTERVAL,
-    /// so a network burst plays out evenly instead of jumping.
+    /// with their arrival times and release on the VLC-style
+    /// buffer clock (next_release_time), so delivery stalls up
+    /// to ~1 s play through instead of freezing the tile.
     /// Unpaced pumps (12 fps tiles, the Watch player) keep the
     /// old latest-only behavior exactly.
     paced: bool,
-    queue: VecDeque<Vec<u8>>,
-    /// Next pacer release time. None = idle: the next arrival
-    /// releases immediately, so steady flow gains no latency
-    /// and the pacer only engages when frames bunch up.
-    next_release: Option<Instant>,
+    queue: VecDeque<(Instant, Vec<u8>)>,
+    /// Last release time for the spacing rule, and the stream's
+    /// measured frame interval (estimate_interval, held across
+    /// stalls so playback doesn't speed up when arrivals pause).
+    last_release: Option<Instant>,
+    interval: Duration,
+    /// Arrival times in the last RATE_WINDOW, feeding the
+    /// interval estimate.
+    arrivals: VecDeque<Instant>,
 }
 
 impl Pump {
@@ -3355,7 +3413,9 @@ fn spawn_pump(
         // fps filter already regularizes those).
         paced: native_fps,
         queue: VecDeque::new(),
-        next_release: None,
+        last_release: None,
+        interval: MIN_RELEASE_INTERVAL,
+        arrivals: VecDeque::new(),
     }
 }
 
@@ -6154,12 +6214,13 @@ impl App {
         }
         self.pump_force.clear();
         // Drain frame channels. Unpaced pumps keep only the
-        // LATEST frame; paced (Native tile) pumps queue arrivals
-        // and release at most one per pacer tick, so a burst
-        // plays out evenly instead of jumping.
+        // LATEST frame; paced (Native tile) pumps hold arrivals
+        // in a VLC-style ~1 s buffer and release on the buffer
+        // clock, so delivery stalls play through instead of
+        // freezing the tile.
         let mut any_active = false;
         let mut next_retry: Option<Instant> = None;
-        let mut next_pacer: Option<Instant> = None;
+        let mut next_wake: Option<Instant> = None;
         for (k, p) in self.pumps.iter_mut() {
             let mut arrived: Vec<Vec<u8>> = Vec::new();
             let mut ended: Option<Option<String>> = None;
@@ -6172,25 +6233,27 @@ impl App {
             // Decide which frame (if any) reaches the texture
             // this pass. The display block below is shared.
             let show: Option<Vec<u8>> = if p.paced {
-                for f in arrived {
-                    pacer_push(&mut p.queue, f, PACER_MAX_QUEUE);
-                }
                 let now = Instant::now();
-                let released = if pacer_due(p.next_release, now) {
-                    p.queue.pop_front()
-                } else {
-                    None
-                };
-                if p.queue.is_empty() {
-                    // Idle again: the next arrival releases
-                    // immediately instead of waiting out a tick.
-                    p.next_release = None;
-                } else if released.is_some() {
-                    p.next_release = Some(now + PACER_INTERVAL);
+                let had_arrivals = !arrived.is_empty();
+                for f in arrived {
+                    pacer_push(&mut p.queue, (now, f), PACER_MAX_QUEUE);
+                    p.arrivals.push_back(now);
                 }
-                // else: not due, queue pending — next_release
-                // already holds the tick; leave it.
-                released
+                prune_arrivals(&mut p.arrivals, now, RATE_WINDOW);
+                if had_arrivals {
+                    // The estimate only moves while frames flow;
+                    // across a stall it holds, so playback
+                    // doesn't speed up when arrivals pause.
+                    p.interval = estimate_interval(&p.arrivals);
+                }
+                let front_arrival = p.queue.front().map(|(t, _)| *t);
+                match front_arrival {
+                    Some(t) if now >= next_release_time(t, p.last_release, p.interval) => {
+                        p.last_release = Some(now);
+                        p.queue.pop_front().map(|(_, f)| f)
+                    }
+                    _ => None,
+                }
             } else {
                 arrived.into_iter().last()
             };
@@ -6225,10 +6288,9 @@ impl App {
                 next_retry = Some(next_retry.map(|x: Instant| x.min(t)).unwrap_or(t));
             }
             if p.paced {
-                if let Some(t) = p.next_release {
-                    if !p.queue.is_empty() {
-                        next_pacer = Some(next_pacer.map(|x: Instant| x.min(t)).unwrap_or(t));
-                    }
+                if let Some((t, _)) = p.queue.front() {
+                    let wake = next_release_time(*t, p.last_release, p.interval);
+                    next_wake = Some(next_wake.map(|x: Instant| x.min(wake)).unwrap_or(wake));
                 }
             }
         }
@@ -6240,11 +6302,11 @@ impl App {
             // fires on time even on an otherwise idle window.
             ctx.request_repaint_after(backoff_wake_delay(Some(t), Instant::now()));
         }
-        if let Some(t) = next_pacer {
-            // Arm a wake-up for the earliest pending pacer release
-            // so a queued burst plays out on time even on an
-            // otherwise idle window. Placed last: under either
-            // repaint-coalescing rule the pacer tick (≤33 ms out)
+        if let Some(t) = next_wake {
+            // Arm a wake-up for the earliest pending buffer
+            // release so held video plays out on time even on
+            // an otherwise idle window. Placed last: under
+            // either repaint-coalescing rule the buffer tick
             // is what fires.
             ctx.request_repaint_after(t.saturating_duration_since(Instant::now()));
         }
@@ -12353,29 +12415,80 @@ mod tests {
 
     #[test]
     fn pacer_queue_bounds_latency() {
-        // v2.0.7 patch: a source bursting faster than the pacer
-        // releases can't grow the queue without bound — the
-        // oldest frames drop, keeping the newest ones.
-        let mut q: VecDeque<Vec<u8>> = VecDeque::new();
-        for i in 0..8 {
-            pacer_push(&mut q, vec![i], PACER_MAX_QUEUE);
+        // v2.0.7 patches: a source flooding faster than the
+        // buffer releases can't grow the queue without bound —
+        // the oldest frames drop, keeping the newest ones.
+        let now = Instant::now();
+        let mut q: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
+        for i in 0..(PACER_MAX_QUEUE + 2) {
+            pacer_push(&mut q, (now, vec![i as u8]), PACER_MAX_QUEUE);
         }
         assert_eq!(q.len(), PACER_MAX_QUEUE);
-        let kept: Vec<u8> = q.iter().map(|f| f[0]).collect();
-        assert_eq!(kept, vec![2, 3, 4, 5, 6, 7]);
+        let kept: Vec<u8> = q.iter().map(|(_, f)| f[0]).collect();
+        assert_eq!(kept[0], 2);
+        assert_eq!(*kept.last().unwrap(), (PACER_MAX_QUEUE + 1) as u8);
     }
 
     #[test]
-    fn pacer_due_rules() {
-        // v2.0.7 patch: idle pumps release immediately; a
-        // pending tick gates releases until it arrives.
+    fn estimate_interval_tracks_the_source_rate() {
+        // v2.0.7 patch 2: the release spacing follows the
+        // stream's own measured rate, not a fixed clock.
+        let base = Instant::now();
+        // Steady 15 fps: 11 arrivals 67 ms apart → ~67 ms.
+        let mut steady: VecDeque<Instant> = VecDeque::new();
+        for i in 0..11 {
+            steady.push_back(base + Duration::from_millis(i * 67));
+        }
+        let iv = estimate_interval(&steady);
+        assert!(iv >= Duration::from_millis(60) && iv <= Duration::from_millis(75));
+        // A burst (all arrivals at once) measures at the floor,
+        // so bursts spread instead of landing together.
+        let mut burst: VecDeque<Instant> = VecDeque::new();
+        for _ in 0..11 {
+            burst.push_back(base);
+        }
+        assert_eq!(estimate_interval(&burst), MIN_RELEASE_INTERVAL);
+        // A very slow source clamps at the ceiling.
+        let mut slow: VecDeque<Instant> = VecDeque::new();
+        for i in 0..6 {
+            slow.push_back(base + Duration::from_millis(i * 300));
+        }
+        assert_eq!(estimate_interval(&slow), MAX_RELEASE_INTERVAL);
+        // Too few arrivals to measure → the floor.
+        assert_eq!(estimate_interval(&VecDeque::new()), MIN_RELEASE_INTERVAL);
+    }
+
+    #[test]
+    fn next_release_time_takes_the_later_rule() {
+        // v2.0.7 patch 2: a frame can't show before its buffer
+        // delay elapses, nor sooner than one source interval
+        // after the previous release.
+        let base = Instant::now();
+        // No previous release: the delay alone decides.
+        assert_eq!(
+            next_release_time(base, None, Duration::from_millis(67)),
+            base + BUFFER_DELAY
+        );
+        // A recent release pushes the next showing later than
+        // the delay would on its own.
+        let last = base + Duration::from_millis(990);
+        assert_eq!(
+            next_release_time(base, Some(last), Duration::from_millis(67)),
+            last + Duration::from_millis(67)
+        );
+    }
+
+    #[test]
+    fn prune_arrivals_keeps_the_window() {
+        // v2.0.7 patch 2: timestamps older than the window
+        // leave, so the rate estimate tracks the live stream.
         let now = Instant::now();
-        assert!(pacer_due(None, now));
-        assert!(pacer_due(
-            Some(now - Duration::from_millis(1)),
-            now
-        ));
-        assert!(!pacer_due(Some(now + Duration::from_millis(100)), now));
+        let mut a: VecDeque<Instant> = VecDeque::new();
+        a.push_back(now - Duration::from_secs(6));
+        a.push_back(now - Duration::from_secs(2));
+        a.push_back(now);
+        prune_arrivals(&mut a, now, RATE_WINDOW);
+        assert_eq!(a.len(), 2);
     }
 
     #[test]
@@ -12471,7 +12584,9 @@ mod tests {
             last_error: None,
             paced: false,
             queue: VecDeque::new(),
-            next_release: None,
+            last_release: None,
+            interval: MIN_RELEASE_INTERVAL,
+            arrivals: VecDeque::new(),
         };
         // Connecting --frame--> Live, streak reset.
         p.note_frame();
