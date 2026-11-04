@@ -3326,6 +3326,16 @@ struct Pump {
     stat_max_arrival_gap_ms: u64,
     stat_last_arrival: Option<Instant>,
     stat_max_queue: usize,
+    /// Decision-level diagnostics (2.0.7 patch): per-window
+    /// counts of drain passes, passes that showed nothing
+    /// with a non-empty queue (held) vs an empty queue, and
+    /// the largest due-in time on a held pass — so a show
+    /// stall can be attributed to an empty queue, a front
+    /// frame that is not yet due, or something else entirely.
+    stat_passes: u64,
+    stat_held: u64,
+    stat_empty: u64,
+    stat_max_due_in_ms: u64,
 }
 
 impl Pump {
@@ -3522,6 +3532,10 @@ fn spawn_pump(
         stat_max_arrival_gap_ms: 0,
         stat_last_arrival: None,
         stat_max_queue: 0,
+        stat_passes: 0,
+        stat_held: 0,
+        stat_empty: 0,
+        stat_max_due_in_ms: 0,
     }
 }
 
@@ -6325,6 +6339,13 @@ impl App {
                                 np.texture = self.held_textures.remove(k);
                             }
                             self.pumps.insert(k.clone(), np);
+                            // Decision-level diagnostics: a
+                            // respawn resets the pump's queue
+                            // and stats, so it must be visible
+                            // in the log, not silent.
+                            crate::hap::tstat_log(&format!(
+                                "camera pump (re)started: {k} ({action:?})"
+                            ));
                         }
                     }
                 }
@@ -6368,13 +6389,16 @@ impl App {
             }
             // Decide which frame (if any) reaches the texture
             // this pass. The display block below is shared.
+            // One timestamp for the whole pass: arrivals
+            // collected here share it, and the held-pass
+            // accounting below reads it too.
+            let now = Instant::now();
             let show: Option<Vec<u8>> = if p.paced {
                 // The tile's Buffer slider retunes this pump's
                 // clock live — no restart when it moves.
                 if let Some(d) = delays.get(k) {
                     p.buffer_delay = *d;
                 }
-                let now = Instant::now();
                 let had_arrivals = !arrived.is_empty();
                 let arrived_n = arrived.len();
                 if had_arrivals {
@@ -6438,6 +6462,34 @@ impl App {
             } else {
                 arrived.into_iter().last()
             };
+            // Decision-level diagnostics: every paced pass
+            // either shows, holds (queue non-empty but front
+            // not due), or finds the queue empty. The due-in
+            // on held passes says how far the front is from
+            // due — the missing piece in the last log round,
+            // where shows stalled 400 ms while passes ran at
+            // 50 ms with a deep queue.
+            if p.paced {
+                p.stat_passes += 1;
+                if show.is_none() {
+                    if p.queue.is_empty() {
+                        p.stat_empty += 1;
+                    } else {
+                        p.stat_held += 1;
+                        if let Some((t, _)) = p.queue.front() {
+                            let due = next_release_time(
+                                *t,
+                                p.prev_sched,
+                                p.interval,
+                                p.buffer_delay,
+                            );
+                            let due_in =
+                                due.saturating_duration_since(now).as_millis() as u64;
+                            p.stat_max_due_in_ms = p.stat_max_due_in_ms.max(due_in);
+                        }
+                    }
+                }
+            }
             if let Some(f) = show {
                 let img = egui::ColorImage::from_rgba_unmultiplied([p.w, p.h], &f);
                 match &mut p.texture {
@@ -6480,7 +6532,7 @@ impl App {
             if p.paced && Instant::now() >= p.stat_window_start + Duration::from_secs(10) {
                 let name = names.get(k).map(|s| s.as_str()).unwrap_or(k.as_str());
                 crate::hap::tstat_log(&format!(
-                    "camera {name}: 10 s — {} arrived, {} shown, {} cap-dropped, {} late-dropped, max release gap {} ms, max arrival gap {} ms, max queue {}",
+                    "camera {name}: 10 s — {} arrived, {} shown, {} cap-dropped, {} late-dropped, max release gap {} ms, max arrival gap {} ms, max queue {}, passes {}, held {}, empty {}, max due-in {} ms, interval {} ms, delay {} ms",
                     p.stat_received,
                     p.stat_shown,
                     p.stat_cap_dropped,
@@ -6488,6 +6540,12 @@ impl App {
                     p.stat_max_release_gap_ms,
                     p.stat_max_arrival_gap_ms,
                     p.stat_max_queue,
+                    p.stat_passes,
+                    p.stat_held,
+                    p.stat_empty,
+                    p.stat_max_due_in_ms,
+                    p.interval.as_millis(),
+                    p.buffer_delay.as_millis(),
                 ));
                 p.stat_window_start = Instant::now();
                 p.stat_received = 0;
@@ -6497,6 +6555,10 @@ impl App {
                 p.stat_max_release_gap_ms = 0;
                 p.stat_max_arrival_gap_ms = 0;
                 p.stat_max_queue = 0;
+                p.stat_passes = 0;
+                p.stat_held = 0;
+                p.stat_empty = 0;
+                p.stat_max_due_in_ms = 0;
             }
         }
         if any_active {
@@ -12910,6 +12972,10 @@ mod tests {
             stat_max_arrival_gap_ms: 0,
             stat_last_arrival: None,
             stat_max_queue: 0,
+            stat_passes: 0,
+            stat_held: 0,
+            stat_empty: 0,
+            stat_max_due_in_ms: 0,
         };
         // Connecting --frame--> Live, streak reset.
         p.note_frame();
