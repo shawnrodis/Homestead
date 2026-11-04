@@ -3156,19 +3156,25 @@ const MIN_RELEASE_INTERVAL: Duration = Duration::from_millis(33);
 const MAX_RELEASE_INTERVAL: Duration = Duration::from_millis(200);
 /// Max queued frames per paced pump (safety cap, ~2 s at
 /// 30 fps): a normal 1 s buffer holds 15–30 frames; beyond the
-/// cap the oldest frames drop.
+/// cap new arrivals drop (patch 5 — dropping the oldest
+/// froze tiles past ~2.75 s at ~22 fps, since no frame lived
+/// long enough to become due to show).
 const PACER_MAX_QUEUE: usize = 60;
 /// Window the source-rate estimate looks back over.
 const RATE_WINDOW: Duration = Duration::from_secs(5);
 
-/// Push a frame onto a buffer queue, dropping the oldest while
-/// the queue exceeds its bound — latency stays capped even if
-/// the source floods faster than the buffer releases.
+/// Push a frame onto a buffer queue, refusing the new frame
+/// while the queue is at its bound — latency stays capped even
+/// if the source floods faster than the buffer releases, and
+/// the buffered frames always survive to their show time.
+/// (Dropping the oldest instead froze tiles whenever the
+/// delay exceeded the cap's capacity: no frame lived long
+/// enough to become due.)
 fn pacer_push(queue: &mut VecDeque<(Instant, Vec<u8>)>, frame: (Instant, Vec<u8>), max: usize) {
-    queue.push_back(frame);
-    while queue.len() > max {
-        queue.pop_front();
+    if queue.len() >= max {
+        return;
     }
+    queue.push_back(frame);
 }
 
 /// Drop arrival timestamps older than the rate window, so the
@@ -12486,7 +12492,11 @@ mod tests {
     fn pacer_queue_bounds_latency() {
         // v2.0.7 patches: a source flooding faster than the
         // buffer releases can't grow the queue without bound —
-        // the oldest frames drop, keeping the newest ones.
+        // new arrivals drop, and the buffered frames always
+        // survive to their show time. (Patch 5: dropping the
+        // oldest instead froze tiles past ~2.75 s at ~22 fps,
+        // since 60 frames ≈ 2.7 s and no frame lived long
+        // enough to become due.)
         let now = Instant::now();
         let mut q: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
         for i in 0..(PACER_MAX_QUEUE + 2) {
@@ -12494,8 +12504,8 @@ mod tests {
         }
         assert_eq!(q.len(), PACER_MAX_QUEUE);
         let kept: Vec<u8> = q.iter().map(|(_, f)| f[0]).collect();
-        assert_eq!(kept[0], 2);
-        assert_eq!(*kept.last().unwrap(), (PACER_MAX_QUEUE + 1) as u8);
+        assert_eq!(kept[0], 0);
+        assert_eq!(*kept.last().unwrap(), (PACER_MAX_QUEUE - 1) as u8);
     }
 
     #[test]
