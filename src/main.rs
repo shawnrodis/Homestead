@@ -5176,6 +5176,14 @@ struct App {
     // cameras
     cam_form: Option<CameraForm>,
     group_backups: HashMap<String, String>,
+    // Pass-timing instrumentation (2.0.7 patch): gap between
+    // consecutive UI passes + drain duration, to tell a slow
+    // render from a late repaint timer. Maxima reset each
+    // 10 s window; last_pass persists across flushes.
+    stat_last_pass: Option<Instant>,
+    stat_max_pass_gap_ms: u64,
+    stat_max_drain_ms: u64,
+    stat_pass_window_start: Instant,
     // auto-update
     update_checking: bool,
     update_info: Option<ReleaseInfo>,
@@ -5493,6 +5501,10 @@ impl App {
             pump_force: HashSet::new(),
             cam_gen: HashMap::new(),
             held_textures: HashMap::new(),
+            stat_last_pass: None,
+            stat_max_pass_gap_ms: 0,
+            stat_max_drain_ms: 0,
+            stat_pass_window_start: Instant::now(),
             prev_focused: true,
             paused_cams: HashSet::new(),
             player_for: None,
@@ -6502,6 +6514,18 @@ impl App {
             // either repaint-coalescing rule the buffer tick
             // is what fires.
             ctx.request_repaint_after(t.saturating_duration_since(Instant::now()));
+        }
+        // Pass-timing instrumentation: one summary line every
+        // 10 s, so a slow render can be told apart from a late
+        // repaint timer.
+        if Instant::now() >= self.stat_pass_window_start + Duration::from_secs(10) {
+            crate::hap::tstat_log(&format!(
+                "ui pass: 10 s — max pass gap {} ms, max drain {} ms",
+                self.stat_max_pass_gap_ms, self.stat_max_drain_ms,
+            ));
+            self.stat_pass_window_start = Instant::now();
+            self.stat_max_pass_gap_ms = 0;
+            self.stat_max_drain_ms = 0;
         }
     }
 
@@ -11854,9 +11878,21 @@ impl eframe::App for App {
         // Tray + close behaviour (v1.2.1): poll tray events, turn a
         // close into a hide when close-to-tray is on.
         self.handle_window_chrome(ui.ctx(), frame);
+        // Pass-timing instrumentation: gap between this pass
+        // and the previous one — the true UI cadence, which
+        // the camera summaries can only imply via show rate.
+        let pass_now = Instant::now();
+        if let Some(last) = self.stat_last_pass {
+            let gap_ms = pass_now.duration_since(last).as_millis() as u64;
+            self.stat_max_pass_gap_ms = self.stat_max_pass_gap_ms.max(gap_ms);
+        }
+        self.stat_last_pass = Some(pass_now);
         // Live previews (v1.2.0): reconcile pumps and upload the
         // latest frames as textures before anything renders.
+        let drain_start = Instant::now();
         self.sync_pumps(ui.ctx());
+        let drain_ms = drain_start.elapsed().as_millis() as u64;
+        self.stat_max_drain_ms = self.stat_max_drain_ms.max(drain_ms);
         // Drag & drop bookkeeping runs BEFORE rendering, hit-testing
         // against last frame's card geometry. It also runs while a
         // press is merely PENDING (v1.2.1), which is when promotion
@@ -15628,6 +15664,10 @@ mod tests {
             pump_force: HashSet::new(),
             cam_gen: HashMap::new(),
             held_textures: HashMap::new(),
+            stat_last_pass: None,
+            stat_max_pass_gap_ms: 0,
+            stat_max_drain_ms: 0,
+            stat_pass_window_start: Instant::now(),
             prev_focused: true,
             paused_cams: HashSet::new(),
             player_for: None,
