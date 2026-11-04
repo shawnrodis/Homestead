@@ -17,7 +17,7 @@ use egui::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -3128,6 +3128,32 @@ fn pump_source_key(ffmpeg: &Path, url: &str, w: usize, h: usize, native_fps: boo
     )
 }
 
+/// Pacer release interval (v2.0.7 patch): one frame per 33 ms
+/// (~30 fps ceiling) — covers Tapo Stream 1/2 native rates.
+/// A burst arriving together plays out at this cadence instead
+/// of landing in a single repaint.
+const PACER_INTERVAL: Duration = Duration::from_millis(33);
+/// Max queued frames per paced pump: ~200 ms of held video.
+/// Beyond that the oldest frames drop, so a fast source can't
+/// grow the queue (and the latency) without bound.
+const PACER_MAX_QUEUE: usize = 6;
+
+/// Push a frame onto a pacer queue, dropping the oldest while
+/// the queue exceeds its bound — latency stays capped even if
+/// the source bursts faster than the pacer releases.
+fn pacer_push(queue: &mut VecDeque<Vec<u8>>, frame: Vec<u8>, max: usize) {
+    queue.push_back(frame);
+    while queue.len() > max {
+        queue.pop_front();
+    }
+}
+
+/// True when a paced pump may release a frame now: idle (no
+/// pending tick) or the pending tick has arrived.
+fn pacer_due(next_release: Option<Instant>, now: Instant) -> bool {
+    next_release.map(|t| now >= t).unwrap_or(true)
+}
+
 /// One running (or backing-off) frame pump, owned by the UI thread.
 struct Pump {
     state: PumpState,
@@ -3144,6 +3170,18 @@ struct Pump {
     /// Last mapped failure reason (v1.2.2) — shown under the
     /// tile's retry status after repeated failures.
     last_error: Option<String>,
+    /// Frame pacer (v2.0.7 patch): true for Native-mode tile
+    /// pumps only. When paced, arrived frames queue in `queue`
+    /// and the drain releases at most one per PACER_INTERVAL,
+    /// so a network burst plays out evenly instead of jumping.
+    /// Unpaced pumps (12 fps tiles, the Watch player) keep the
+    /// old latest-only behavior exactly.
+    paced: bool,
+    queue: VecDeque<Vec<u8>>,
+    /// Next pacer release time. None = idle: the next arrival
+    /// releases immediately, so steady flow gains no latency
+    /// and the pacer only engages when frames bunch up.
+    next_release: Option<Instant>,
 }
 
 impl Pump {
@@ -3185,8 +3223,10 @@ impl Pump {
 /// Spawn the worker thread for one pump. The thread runs ffmpeg,
 /// reads exact w×h RGBA frames and forwards them; it keeps ffmpeg
 /// blocked on a full pipe rather than building a backlog here, and
-/// the UI keeps only the latest frame, so a slow frame is dropped,
-/// never queued. ffmpeg's stderr is captured (last few lines) so
+/// the UI keeps only the latest frame for unpaced pumps, so a slow
+/// frame is dropped, never queued — while paced (Native tile)
+/// pumps queue frames and release them on the pacer clock.
+/// ffmpeg's stderr is captured (last few lines) so
 /// an exit can carry its mapped failure reason (v1.2.2).
 /// `source_key` is computed by the caller (sync_pumps) so the
 /// generation tag for camera edits rides along.
@@ -3310,6 +3350,12 @@ fn spawn_pump(
         streak: 0,
         retry_at: None,
         last_error: None,
+        // The pacer follows the frame-rate mode: Native tiles
+        // pace, 12 fps tiles and the Watch player don't (the
+        // fps filter already regularizes those).
+        paced: native_fps,
+        queue: VecDeque::new(),
+        next_release: None,
     }
 }
 
@@ -6107,19 +6153,48 @@ impl App {
             }
         }
         self.pump_force.clear();
-        // Drain frame channels: keep only the LATEST frame per pump.
+        // Drain frame channels. Unpaced pumps keep only the
+        // LATEST frame; paced (Native tile) pumps queue arrivals
+        // and release at most one per pacer tick, so a burst
+        // plays out evenly instead of jumping.
         let mut any_active = false;
         let mut next_retry: Option<Instant> = None;
+        let mut next_pacer: Option<Instant> = None;
         for (k, p) in self.pumps.iter_mut() {
-            let mut latest: Option<Vec<u8>> = None;
+            let mut arrived: Vec<Vec<u8>> = Vec::new();
             let mut ended: Option<Option<String>> = None;
             while let Ok(m) = p.rx.try_recv() {
                 match m {
-                    FrameMsg::Frame(f) => latest = Some(f),
+                    FrameMsg::Frame(f) => arrived.push(f),
                     FrameMsg::Ended(reason) => ended = Some(reason),
                 }
             }
-            if let Some(f) = latest {
+            // Decide which frame (if any) reaches the texture
+            // this pass. The display block below is shared.
+            let show: Option<Vec<u8>> = if p.paced {
+                for f in arrived {
+                    pacer_push(&mut p.queue, f, PACER_MAX_QUEUE);
+                }
+                let now = Instant::now();
+                let released = if pacer_due(p.next_release, now) {
+                    p.queue.pop_front()
+                } else {
+                    None
+                };
+                if p.queue.is_empty() {
+                    // Idle again: the next arrival releases
+                    // immediately instead of waiting out a tick.
+                    p.next_release = None;
+                } else if released.is_some() {
+                    p.next_release = Some(now + PACER_INTERVAL);
+                }
+                // else: not due, queue pending — next_release
+                // already holds the tick; leave it.
+                released
+            } else {
+                arrived.into_iter().last()
+            };
+            if let Some(f) = show {
                 let img = egui::ColorImage::from_rgba_unmultiplied([p.w, p.h], &f);
                 match &mut p.texture {
                     Some(t) => t.set(img, egui::TextureOptions::LINEAR),
@@ -6149,6 +6224,13 @@ impl App {
             } else if let Some(t) = p.retry_at {
                 next_retry = Some(next_retry.map(|x: Instant| x.min(t)).unwrap_or(t));
             }
+            if p.paced {
+                if let Some(t) = p.next_release {
+                    if !p.queue.is_empty() {
+                        next_pacer = Some(next_pacer.map(|x: Instant| x.min(t)).unwrap_or(t));
+                    }
+                }
+            }
         }
         if any_active {
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -6157,6 +6239,14 @@ impl App {
             // Arm a wake-up for the earliest scheduled retry so it
             // fires on time even on an otherwise idle window.
             ctx.request_repaint_after(backoff_wake_delay(Some(t), Instant::now()));
+        }
+        if let Some(t) = next_pacer {
+            // Arm a wake-up for the earliest pending pacer release
+            // so a queued burst plays out on time even on an
+            // otherwise idle window. Placed last: under either
+            // repaint-coalescing rule the pacer tick (≤33 ms out)
+            // is what fires.
+            ctx.request_repaint_after(t.saturating_duration_since(Instant::now()));
         }
     }
 
@@ -12262,6 +12352,33 @@ mod tests {
     }
 
     #[test]
+    fn pacer_queue_bounds_latency() {
+        // v2.0.7 patch: a source bursting faster than the pacer
+        // releases can't grow the queue without bound — the
+        // oldest frames drop, keeping the newest ones.
+        let mut q: VecDeque<Vec<u8>> = VecDeque::new();
+        for i in 0..8 {
+            pacer_push(&mut q, vec![i], PACER_MAX_QUEUE);
+        }
+        assert_eq!(q.len(), PACER_MAX_QUEUE);
+        let kept: Vec<u8> = q.iter().map(|f| f[0]).collect();
+        assert_eq!(kept, vec![2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn pacer_due_rules() {
+        // v2.0.7 patch: idle pumps release immediately; a
+        // pending tick gates releases until it arrives.
+        let now = Instant::now();
+        assert!(pacer_due(None, now));
+        assert!(pacer_due(
+            Some(now - Duration::from_millis(1)),
+            now
+        ));
+        assert!(!pacer_due(Some(now + Duration::from_millis(100)), now));
+    }
+
+    #[test]
     fn old_camera_config_loads_as_low_fps() {
         // v2.0.7: configs written before the toggle carry no
         // fps_mode — they must load as the old behavior (12 fps),
@@ -12352,6 +12469,9 @@ mod tests {
             streak: 0,
             retry_at: None,
             last_error: None,
+            paced: false,
+            queue: VecDeque::new(),
+            next_release: None,
         };
         // Connecting --frame--> Live, streak reset.
         p.note_frame();
